@@ -1,196 +1,171 @@
 # StorageMover
 
-Enterprise storage migration tool for Dell EMC Isilon to PowerScale and PowerStore devices.
+<div align="center">
+
+![StorageMover](https://img.shields.io/badge/StorageMover-Enterprise%20Migration-007DB8?style=for-the-badge)
+![Node.js](https://img.shields.io/badge/Node.js-20+-339933?style=for-the-badge&logo=node.js&logoColor=white)
+![React](https://img.shields.io/badge/React-18-61DAFB?style=for-the-badge&logo=react&logoColor=black)
+![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?style=for-the-badge&logo=typescript&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=for-the-badge&logo=docker&logoColor=white)
+
+**Enterprise storage migration tool for Dell EMC Isilon to PowerScale and PowerStore**
+
+[Features](#features) • [Quick Start](#quick-start) • [Documentation](#documentation) • [Screenshots](#screenshots)
+
+</div>
+
+---
 
 ## Features
 
-- **Device Management**: Connect to and authenticate with Dell EMC Isilon, PowerScale, and PowerStore storage devices
-- **Export Discovery**: Automatically catalog all NFS exports and SMB shares from Isilon systems
-- **Configuration Generation**: Create migration scripts for PowerScale devices
-- **Data Migration**: Execute data migrations from Isilon to PowerScale with real-time progress tracking
-- **PowerStore Support**: Export and import configurations to/from PowerStore devices
-- **Web Interface**: Modern React-based UI for managing all migration tasks
-- **Real-time Updates**: WebSocket support for live migration progress updates
+| Feature | Description |
+|---------|-------------|
+| **Device Management** | Connect to Isilon, PowerScale, and PowerStore devices |
+| **Export Discovery** | Auto-discover NFS exports and SMB shares |
+| **Data Migration** | Transfer data with real-time progress tracking |
+| **Config Generation** | Generate migration scripts for target devices |
+| **Web Interface** | Modern, responsive UI for all operations |
+| **Real-time Updates** | WebSocket-powered live status updates |
 
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     StorageMover                             │
-├─────────────────────────────────────────────────────────────┤
-│  Frontend (React + TypeScript)                               │
-│  - Dashboard, Device Management, Export Browser              │
-│  - Migration Control, Configuration Generator                │
-├─────────────────────────────────────────────────────────────┤
-│  Backend (Node.js + Express + TypeScript)                    │
-│  - REST API, WebSocket Server                                │
-│  - Device Clients (Isilon, PowerScale, PowerStore)           │
-│  - Migration Service, Configuration Export                   │
-├─────────────────────────────────────────────────────────────┤
-│  Database (SQLite)                                           │
-│  - Devices, Exports, Migrations, Configurations              │
-└─────────────────────────────────────────────────────────────┘
-```
+---
 
 ## Quick Start
 
-### Using Docker (Recommended)
+### Windows (One-Click Deploy)
+
+```batch
+deploy.bat
+```
+
+That's it! The script handles everything automatically.
+
+### Docker
 
 ```bash
-# Clone the repository
-git clone <repository-url>
-cd StorageMover
-
-# Start with Docker Compose
 docker-compose up -d
-
-# Access the application at http://localhost:3001
 ```
 
 ### Manual Setup
 
 ```bash
-# Install backend dependencies
 npm install
-
-# Install frontend dependencies
 cd client && npm install && cd ..
-
-# Create environment file
 cp .env.example .env
-
-# Start development server
 npm run dev
 ```
 
-## Configuration
+**Access the application at** → `http://localhost:3001`
 
-Copy `.env.example` to `.env` and configure:
+---
 
-```env
-# Server Configuration
-NODE_ENV=development
-PORT=3001
+## Architecture
 
-# Security (CHANGE IN PRODUCTION!)
-JWT_SECRET=your-secure-jwt-secret
-ENCRYPTION_KEY=your-32-byte-encryption-key
-
-# Database
-DB_PATH=./data/storagemover.db
-
-# Logging
-LOG_LEVEL=info
+```
+┌────────────────────────────────────────────────────────────────┐
+│                        StorageMover                            │
+├────────────────────────────────────────────────────────────────┤
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │  Frontend (React + TypeScript + Tailwind)                │  │
+│  │  • Dashboard  • Devices  • Exports  • Migrations         │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                              ▼                                 │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │  Backend (Node.js + Express + TypeScript)                │  │
+│  │  • REST API  • WebSocket  • Device Clients               │  │
+│  └──────────────────────────────────────────────────────────┘  │
+│                              ▼                                 │
+│  ┌──────────────────────────────────────────────────────────┐  │
+│  │  Database (SQLite)                                       │  │
+│  │  • Devices  • Exports  • Migrations  • Configs           │  │
+│  └──────────────────────────────────────────────────────────┘  │
+└────────────────────────────────────────────────────────────────┘
 ```
 
-## Usage
+---
 
-### 1. Add Storage Devices
+## Usage Overview
 
-Navigate to **Devices** and add your storage systems:
-- **Isilon**: Source devices for migration
-- **PowerScale**: Target devices for migration
-- **PowerStore**: For configuration export/import
+### 1. Add Devices
+Connect to your Dell EMC storage systems (Isilon, PowerScale, PowerStore)
 
 ### 2. Discover Exports
-
-Click **Discover** on any Isilon device to scan for:
-- NFS exports
-- SMB shares
+Scan devices to find NFS exports and SMB shares
 
 ### 3. Create Migration
+Select source exports and target device, then start migration
 
-Go to **Migrations** and create a new job:
-1. Select source Isilon device
-2. Select target PowerScale device
-3. Choose exports to migrate
-4. Start the migration
+### 4. Monitor Progress
+Track real-time progress with WebSocket updates
 
-### 4. Generate Configuration Scripts
+---
 
-Use **Configuration** to:
-- Generate shell scripts for PowerScale
-- Apply configurations directly via API
-- Export/import PowerStore configurations
+## Documentation
 
-## API Endpoints
+| Document | Description |
+|----------|-------------|
+| [API Reference](docs/API.md) | REST API endpoints and examples |
+| [Configuration](docs/CONFIGURATION.md) | Environment variables and settings |
+| [Deployment](docs/DEPLOYMENT.md) | Production deployment guide |
+| [Development](docs/DEVELOPMENT.md) | Local development setup |
+| [Troubleshooting](docs/TROUBLESHOOTING.md) | Common issues and solutions |
 
-### Authentication
-- `POST /api/auth/register` - Register new user
-- `POST /api/auth/login` - Login
-- `GET /api/auth/verify` - Verify token
+---
 
-### Devices
-- `GET /api/devices` - List all devices
-- `POST /api/devices` - Add device
-- `POST /api/devices/:id/test` - Test connection
-- `POST /api/devices/:id/discover` - Discover exports
+## Tech Stack
 
-### Exports
-- `GET /api/exports` - List discovered exports
-- `GET /api/exports?deviceId=:id` - Filter by device
+<table>
+<tr>
+<td align="center" width="33%">
 
-### Migrations
-- `GET /api/migrations` - List migrations
-- `POST /api/migrations` - Create migration
-- `POST /api/migrations/:id/start` - Start migration
-- `POST /api/migrations/:id/pause` - Pause migration
-- `POST /api/migrations/:id/cancel` - Cancel migration
-
-### Configuration
-- `POST /api/config/powerscale/generate` - Generate script
-- `POST /api/config/powerscale/apply` - Apply directly
-- `POST /api/config/powerstore/export` - Export config
-- `POST /api/config/powerstore/import` - Import config
-
-## Technology Stack
-
-### Backend
+**Backend**
 - Node.js 20+
 - TypeScript
 - Express.js
 - SQLite3
-- WebSocket (ws)
-- Axios for API calls
-- bcryptjs for password hashing
-- JWT for authentication
+- WebSocket
 
-### Frontend
+</td>
+<td align="center" width="33%">
+
+**Frontend**
 - React 18
 - TypeScript
 - Vite
 - Tailwind CSS
-- React Router
 - Lucide Icons
 
-### Infrastructure
-- Docker & Docker Compose
-- Health checks
-- Volume persistence
+</td>
+<td align="center" width="33%">
 
-## Security Considerations
+**Infrastructure**
+- Docker
+- Docker Compose
+- Health Checks
+- Volume Persistence
 
-- All device passwords are encrypted at rest using AES-256
-- JWT tokens for API authentication
-- HTTPS recommended for production deployment
-- Change default secrets in production
+</td>
+</tr>
+</table>
 
-## Development
+---
 
-```bash
-# Run in development mode (hot reload)
-npm run dev
+## Security
 
-# Build for production
-npm run build
+- AES-256 encryption for stored passwords
+- JWT authentication
+- HTTPS recommended for production
+- Non-root Docker user
 
-# Run production build
-npm start
-
-# Lint code
-npm run lint
-```
+---
 
 ## License
 
-MIT License
+MIT License - see [LICENSE](LICENSE) for details
+
+---
+
+<div align="center">
+
+**[⬆ Back to Top](#storagemover)**
+
+</div>
