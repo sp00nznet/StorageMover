@@ -1,1 +1,3 @@
 # StorageMover
+
+This application will be a containerized server. it will have a web interface. the tool will log into isilon storage devices. take note of all network exports. the app will then log into a powerscale device. it will create a configuration that can be ran on the powerscale device to copy the network exports. The application will have the ability to move the contents from isilon to powerscale. There also is a Powerstore device here. I will need the ability to export configurations to it as well. 
