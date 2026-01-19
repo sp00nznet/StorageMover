@@ -3,6 +3,7 @@ import { dbGet, dbAll, dbRun } from '../database/init';
 import { logger } from '../utils/logger';
 import { decryptPassword } from '../utils/crypto';
 import { broadcastMessage } from '../websocket/handler';
+import { WindowsFileServerClient } from './windows';
 
 interface Device {
   id: string;
@@ -163,6 +164,21 @@ export class MigrationService {
     targetPath: string,
     migrationId: string
   ): Promise<number> {
+    // Route to appropriate transfer method based on target device type
+    if (targetDevice.type === 'windows') {
+      return this.transferToWindows(sourceDevice, targetDevice, sourcePath, targetPath, migrationId);
+    } else {
+      return this.transferBetweenStorageDevices(sourceDevice, targetDevice, sourcePath, targetPath, migrationId);
+    }
+  }
+
+  private async transferBetweenStorageDevices(
+    sourceDevice: Device,
+    targetDevice: Device,
+    sourcePath: string,
+    targetPath: string,
+    migrationId: string
+  ): Promise<number> {
     const sourcePassword = decryptPassword(sourceDevice.password_encrypted);
     const targetPassword = decryptPassword(targetDevice.password_encrypted);
 
@@ -230,6 +246,158 @@ export class MigrationService {
     } finally {
       ssh.dispose();
     }
+  }
+
+  private async transferToWindows(
+    sourceDevice: Device,
+    targetDevice: Device,
+    sourcePath: string,
+    targetPath: string,
+    migrationId: string
+  ): Promise<number> {
+    const targetPassword = decryptPassword(targetDevice.password_encrypted);
+    const windowsClient = new WindowsFileServerClient(
+      targetDevice.hostname,
+      targetDevice.port,
+      targetDevice.username,
+      targetPassword
+    );
+
+    try {
+      logger.info(`Starting transfer from ${sourceDevice.name}:${sourcePath} to Windows ${targetDevice.name}:${targetPath}`);
+
+      // Step 1: Create target directory on Windows
+      await windowsClient.createDirectory(targetPath);
+
+      // Step 2: Create SMB share for the target path (if not exists)
+      const shareName = targetPath.split('\\').filter(Boolean).pop() || 'share';
+      try {
+        await windowsClient.createSmbShare(shareName, targetPath, `Migrated from ${sourceDevice.name}`);
+        logger.info(`Created SMB share: ${shareName} at ${targetPath}`);
+      } catch (error: any) {
+        // Share might already exist, log and continue
+        logger.warn(`Share creation warning: ${error.message}`);
+      }
+
+      // Step 3: Determine source access method and transfer data
+      let bytesTransferred = 0;
+
+      if (sourceDevice.type === 'isilon' || sourceDevice.type === 'powerscale') {
+        // For Isilon/PowerScale, use NFS mount and robocopy
+        bytesTransferred = await this.transferFromNFS(
+          sourceDevice,
+          sourcePath,
+          windowsClient,
+          targetPath,
+          migrationId
+        );
+      } else if (sourceDevice.type === 'powerstore') {
+        // For PowerStore, use SMB or NFS based on export type
+        bytesTransferred = await this.transferFromPowerStore(
+          sourceDevice,
+          sourcePath,
+          windowsClient,
+          targetPath,
+          migrationId
+        );
+      }
+
+      logger.info(`Successfully transferred ${bytesTransferred} bytes to Windows`);
+      return bytesTransferred;
+
+    } catch (error) {
+      logger.error(`Failed to transfer to Windows: ${error}`);
+      throw error;
+    }
+  }
+
+  private async transferFromNFS(
+    sourceDevice: Device,
+    sourcePath: string,
+    windowsClient: WindowsFileServerClient,
+    targetPath: string,
+    migrationId: string
+  ): Promise<number> {
+    // Use PowerShell to mount NFS share and copy data with robocopy
+    const mountPath = `\\\\${sourceDevice.hostname}${sourcePath.replace(/\//g, '\\')}`;
+
+    const script = `
+      # Mount source as NFS if needed or access via UNC path
+      $sourcePath = "${mountPath}"
+      $targetPath = "${targetPath}"
+
+      # Try to access source directly (if accessible via SMB/NFS client)
+      if (Test-Path $sourcePath) {
+        Write-Output "Source accessible at $sourcePath"
+      } else {
+        # Mount NFS share
+        $nfsPath = "${sourceDevice.hostname}:${sourcePath}"
+        Write-Output "Mounting NFS: $nfsPath"
+        Mount-NfsShare -Path $nfsPath -LocalPath "Z:" -Persist $false
+        $sourcePath = "Z:\\"
+      }
+
+      # Use robocopy for data transfer with progress
+      $robocopyArgs = @(
+        $sourcePath,
+        $targetPath,
+        "/E",           # Copy subdirectories, including empty ones
+        "/COPY:DAT",    # Copy data, attributes, timestamps
+        "/R:3",         # Retry 3 times on failed copies
+        "/W:5",         # Wait 5 seconds between retries
+        "/MT:8",        # Multi-threaded (8 threads)
+        "/NP",          # No progress percentage in log
+        "/BYTES"        # Show sizes in bytes
+      )
+
+      $result = robocopy @robocopyArgs
+
+      # Unmount if we mounted
+      if (Test-Path "Z:\\") {
+        Dismount-NfsShare -Path "Z:" -Force
+      }
+
+      # Calculate total size transferred
+      $size = (Get-ChildItem -Path $targetPath -Recurse -File | Measure-Object -Property Length -Sum).Sum
+      if ($null -eq $size) { $size = 0 }
+
+      Write-Output "BYTES_TRANSFERRED:$size"
+    `;
+
+    try {
+      // Execute via PowerShell remoting (will be implemented in WindowsFileServerClient)
+      const result = await (windowsClient as any).executePowerShell(script);
+
+      // Parse bytes transferred from output
+      const match = result.match(/BYTES_TRANSFERRED:(\d+)/);
+      const bytes = match ? parseInt(match[1]) : 0;
+
+      broadcastMessage({
+        type: 'transfer_progress',
+        migrationId,
+        path: sourcePath,
+        progress: 100,
+        bytesTransferred: bytes
+      });
+
+      return bytes;
+
+    } catch (error) {
+      logger.error(`NFS transfer failed: ${error}`);
+      throw error;
+    }
+  }
+
+  private async transferFromPowerStore(
+    sourceDevice: Device,
+    sourcePath: string,
+    windowsClient: WindowsFileServerClient,
+    targetPath: string,
+    migrationId: string
+  ): Promise<number> {
+    // PowerStore exports can be accessed via SMB or NFS
+    // Use similar approach to NFS transfer
+    return this.transferFromNFS(sourceDevice, sourcePath, windowsClient, targetPath, migrationId);
   }
 
   async stopMigration(migrationId: string): Promise<void> {

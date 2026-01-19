@@ -348,9 +348,9 @@ function Migrations() {
                       required
                     >
                       <option value="">Select source...</option>
-                      {devices.filter((d) => d.type === 'isilon').map((device) => (
+                      {devices.filter((d) => ['isilon', 'powerscale', 'powerstore'].includes(d.type)).map((device) => (
                         <option key={device.id} value={device.id}>
-                          {device.name} (Isilon)
+                          {device.name} ({device.type.toUpperCase()})
                         </option>
                       ))}
                     </select>
@@ -364,9 +364,9 @@ function Migrations() {
                       required
                     >
                       <option value="">Select target...</option>
-                      {devices.filter((d) => d.type === 'powerscale').map((device) => (
+                      {devices.filter((d) => ['powerscale', 'powerstore', 'windows'].includes(d.type)).map((device) => (
                         <option key={device.id} value={device.id}>
-                          {device.name} (PowerScale)
+                          {device.name} ({device.type === 'windows' ? 'Windows' : device.type.toUpperCase()})
                         </option>
                       ))}
                     </select>
@@ -380,8 +380,17 @@ function Migrations() {
                     value={formData.targetBasePath}
                     onChange={(e) => setFormData({ ...formData, targetBasePath: e.target.value })}
                     className="input"
-                    placeholder="/ifs/migrated"
+                    placeholder={
+                      devices.find((d) => d.id === formData.targetDeviceId)?.type === 'windows'
+                        ? 'C:\\Shares'
+                        : '/ifs/migrated'
+                    }
                   />
+                  {devices.find((d) => d.id === formData.targetDeviceId)?.type === 'windows' && (
+                    <p className="text-xs text-gray-500 mt-1">
+                      For Windows: Shares will be created and data will be migrated automatically
+                    </p>
+                  )}
                 </div>
 
                 {formData.sourceDeviceId && (

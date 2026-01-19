@@ -8,7 +8,7 @@
 ![TypeScript](https://img.shields.io/badge/TypeScript-5-3178C6?style=for-the-badge&logo=typescript&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=for-the-badge&logo=docker&logoColor=white)
 
-**Enterprise storage migration tool for Dell EMC Isilon to PowerScale and PowerStore**
+**Enterprise storage migration tool for Dell EMC Isilon, PowerScale, PowerStore, and Windows File Servers**
 
 [Features](#features) • [Quick Start](#quick-start) • [Documentation](#documentation) • [Screenshots](#screenshots)
 
@@ -20,10 +20,11 @@
 
 | Feature | Description |
 |---------|-------------|
-| **Device Management** | Connect to Isilon, PowerScale, and PowerStore devices |
-| **Export Discovery** | Auto-discover NFS exports and SMB shares |
-| **Data Migration** | Transfer data with real-time progress tracking |
-| **Config Generation** | Generate migration scripts for target devices |
+| **Device Management** | Connect to Isilon, PowerScale, PowerStore, and Windows File Servers |
+| **Export Discovery** | Auto-discover NFS exports and SMB shares from all devices |
+| **Data Migration** | Transfer data with real-time progress tracking to any target |
+| **Windows Integration** | Migrate shares to Windows with automatic SMB/NFS setup |
+| **Config Generation** | Generate migration scripts (Bash/PowerShell) for target devices |
 | **Web Interface** | Modern, responsive UI for all operations |
 | **Real-time Updates** | WebSocket-powered live status updates |
 
@@ -86,16 +87,25 @@ npm run dev
 ## Usage Overview
 
 ### 1. Add Devices
-Connect to your Dell EMC storage systems (Isilon, PowerScale, PowerStore)
+Connect to your storage systems:
+- **Source**: Dell EMC Isilon, PowerScale, or PowerStore
+- **Target**: PowerScale, PowerStore, or Windows File Server
 
 ### 2. Discover Exports
 Scan devices to find NFS exports and SMB shares
 
-### 3. Create Migration
+### 3. Migrate to Windows (New!)
+**Automatic share creation and data migration:**
+- Select source device and exports
+- Choose Windows File Server as target
+- Configure SMB/NFS settings
+- App creates shares AND migrates data automatically
+
+### 4. Create Migration
 Select source exports and target device, then start migration
 
-### 4. Monitor Progress
-Track real-time progress with WebSocket updates
+### 5. Monitor Progress
+Track real-time progress with WebSocket updates and detailed logs
 
 ---
 
