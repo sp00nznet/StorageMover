@@ -12,6 +12,16 @@ export interface WindowsShare {
   permissions: any;
 }
 
+export interface MountConfig {
+  sourceHostname: string;
+  sourcePath: string;
+  sourceType: 'nfs' | 'smb';
+  sourceUsername?: string;
+  sourcePassword?: string;
+  mountPoint?: string; // e.g., "Z:", if not provided will auto-assign
+  persistent?: boolean; // Mount survives reboots
+}
+
 export interface WindowsExportConfig {
   sourceExports: {
     path: string;
@@ -533,6 +543,263 @@ try {
             error: error.message
           });
         }
+      }
+    }
+
+    const allSuccess = results.every(r => r.success);
+    return { success: allSuccess, results };
+  }
+
+  /**
+   * Mount remote NFS or SMB share on Windows server
+   * This enables Windows to act as a storage gateway/proxy
+   */
+  async mountRemoteShare(config: MountConfig): Promise<{ mountPoint: string; success: boolean }> {
+    try {
+      let script = '';
+      let mountPoint = config.mountPoint;
+
+      if (config.sourceType === 'nfs') {
+        // Mount NFS share
+        // Auto-assign drive letter if not provided
+        if (!mountPoint) {
+          mountPoint = await this.getAvailableDriveLetter();
+        }
+
+        const persistFlag = config.persistent ? '-Persist' : '';
+
+        script = `
+          # Mount NFS share
+          $nfsPath = "${config.sourceHostname}:${config.sourcePath}"
+          $mountPoint = "${mountPoint}"
+
+          # Check if NFS Client is installed
+          $nfsClient = Get-WindowsFeature -Name NFS-Client -ErrorAction SilentlyContinue
+          if (!$nfsClient -or !$nfsClient.Installed) {
+            Write-Output "ERROR: NFS Client not installed. Install with: Install-WindowsFeature -Name NFS-Client"
+            exit 1
+          }
+
+          # Unmount if already mounted
+          $existing = Get-PSDrive -Name $mountPoint.Replace(':', '') -ErrorAction SilentlyContinue
+          if ($existing) {
+            Remove-PSDrive -Name $mountPoint.Replace(':', '') -Force -ErrorAction SilentlyContinue
+          }
+
+          # Mount the NFS share
+          New-PSDrive -Name $mountPoint.Replace(':', '') -PSProvider FileSystem -Root $nfsPath ${persistFlag} -ErrorAction Stop
+
+          Write-Output "SUCCESS: Mounted $nfsPath to $mountPoint"
+          Write-Output "MOUNT_POINT:$mountPoint"
+        `;
+      } else {
+        // Mount SMB share
+        if (!mountPoint) {
+          mountPoint = await this.getAvailableDriveLetter();
+        }
+
+        const persistFlag = config.persistent ? '$true' : '$false';
+
+        // Build credential if provided
+        let credentialSetup = '';
+        if (config.sourceUsername && config.sourcePassword) {
+          credentialSetup = `
+            $securePassword = ConvertTo-SecureString "${config.sourcePassword}" -AsPlainText -Force
+            $credential = New-Object System.Management.Automation.PSCredential("${config.sourceUsername}", $securePassword)
+            $credParam = @{ Credential = $credential }
+          `;
+        } else {
+          credentialSetup = '$credParam = @{}';
+        }
+
+        script = `
+          # Mount SMB share
+          $smbPath = "\\\\${config.sourceHostname}${config.sourcePath.replace(/\//g, '\\')}"
+          $mountPoint = "${mountPoint}"
+
+          ${credentialSetup}
+
+          # Remove existing mapping if present
+          if (Test-Path $mountPoint) {
+            net use $mountPoint /delete /y 2>$null
+          }
+
+          # Map the network drive
+          if ($credParam.Count -gt 0) {
+            $cred = $credParam.Credential
+            net use $mountPoint $smbPath /user:$($cred.UserName) $($cred.GetNetworkCredential().Password) /persistent:$(if(${persistFlag}) {'yes'} else {'no'})
+          } else {
+            net use $mountPoint $smbPath /persistent:$(if(${persistFlag}) {'yes'} else {'no'})
+          }
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Failed to mount SMB share"
+          }
+
+          Write-Output "SUCCESS: Mounted $smbPath to $mountPoint"
+          Write-Output "MOUNT_POINT:$mountPoint"
+        `;
+      }
+
+      const result = await this.executePowerShell(script);
+
+      if (result.includes('ERROR:')) {
+        throw new Error(result);
+      }
+
+      // Extract mount point from result
+      const match = result.match(/MOUNT_POINT:(.+)/);
+      const actualMountPoint = match ? match[1].trim() : mountPoint || '';
+
+      logger.info(`Successfully mounted ${config.sourceHostname}:${config.sourcePath} to ${actualMountPoint}`);
+
+      return {
+        mountPoint: actualMountPoint,
+        success: true
+      };
+
+    } catch (error: any) {
+      logger.error(`Failed to mount remote share: ${error.message}`);
+      throw error;
+    }
+  }
+
+  /**
+   * Get next available drive letter for mounting
+   */
+  private async getAvailableDriveLetter(): Promise<string> {
+    const script = `
+      # Get all used drive letters
+      $usedDrives = Get-PSDrive -PSProvider FileSystem | Select-Object -ExpandProperty Name
+
+      # Find first available letter from Z to A (reverse to avoid conflicts)
+      $letters = [char[]]([char]'Z'..[char]'A')
+      foreach ($letter in $letters) {
+        $drive = "$letter:"
+        if ($usedDrives -notcontains $letter) {
+          Write-Output $drive
+          break
+        }
+      }
+    `;
+
+    try {
+      const result = await this.executePowerShell(script);
+      return result.trim() || 'Z:';
+    } catch (error) {
+      // Fallback to Z: if detection fails
+      return 'Z:';
+    }
+  }
+
+  /**
+   * Unmount a remote share
+   */
+  async unmountRemoteShare(mountPoint: string, type: 'nfs' | 'smb'): Promise<boolean> {
+    try {
+      const script = `
+        # Unmount the share
+        if (Test-Path "${mountPoint}") {
+          net use ${mountPoint} /delete /y
+          if ($LASTEXITCODE -eq 0) {
+            Write-Output "Successfully unmounted ${mountPoint}"
+          } else {
+            # Try PowerShell method
+            Remove-PSDrive -Name "${mountPoint.replace(':', '')}" -Force -ErrorAction Stop
+            Write-Output "Successfully unmounted ${mountPoint}"
+          }
+        } else {
+          Write-Output "Mount point ${mountPoint} not found"
+        }
+      `;
+
+      await this.executePowerShell(script);
+      logger.info(`Successfully unmounted ${mountPoint}`);
+      return true;
+
+    } catch (error: any) {
+      logger.error(`Failed to unmount ${mountPoint}: ${error.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * List all current mounts (NFS and SMB)
+   */
+  async listMounts(): Promise<{ mounts: any[] }> {
+    try {
+      const script = `
+        # Get all network drives
+        $drives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.DisplayRoot -like '*\\\\*' -or $_.DisplayRoot -like '*:*' }
+        $drives | Select-Object Name, @{Name='LocalPath';Expression={$_.Name+':'}}, @{Name='RemotePath';Expression={$_.DisplayRoot}} | ConvertTo-Json -Compress
+      `;
+
+      const result = await this.executePowerShell(script);
+
+      try {
+        const parsed = JSON.parse(result);
+        const mounts = Array.isArray(parsed) ? parsed : (parsed ? [parsed] : []);
+        return { mounts };
+      } catch {
+        return { mounts: [] };
+      }
+
+    } catch (error: any) {
+      logger.warn(`Failed to list mounts: ${error.message}`);
+      return { mounts: [] };
+    }
+  }
+
+  /**
+   * Create a proxy share - SMB/NFS share that points to a mounted path
+   * This enables Windows to re-export remote shares
+   */
+  async createProxyShare(
+    shareName: string,
+    mountedPath: string,
+    exportType: 'nfs' | 'smb' | 'both',
+    description: string = '',
+    options: WindowsExportConfig['smbSettings'] = {}
+  ): Promise<{ success: boolean; results: any[] }> {
+    const results: any[] = [];
+
+    // Create SMB share pointing to mounted path
+    if (exportType === 'smb' || exportType === 'both') {
+      try {
+        await this.createSmbShare(shareName, mountedPath, description, options);
+        results.push({
+          action: 'createSmbProxyShare',
+          name: shareName,
+          path: mountedPath,
+          success: true
+        });
+      } catch (error: any) {
+        results.push({
+          action: 'createSmbProxyShare',
+          name: shareName,
+          path: mountedPath,
+          success: false,
+          error: error.message
+        });
+      }
+    }
+
+    // Create NFS export pointing to mounted path
+    if (exportType === 'nfs' || exportType === 'both') {
+      try {
+        await this.createNfsShare(mountedPath);
+        results.push({
+          action: 'createNfsProxyShare',
+          path: mountedPath,
+          success: true
+        });
+      } catch (error: any) {
+        results.push({
+          action: 'createNfsProxyShare',
+          path: mountedPath,
+          success: false,
+          error: error.message
+        });
       }
     }
 

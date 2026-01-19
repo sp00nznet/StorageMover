@@ -255,6 +255,7 @@ export class MigrationService {
     targetPath: string,
     migrationId: string
   ): Promise<number> {
+    const sourcePassword = decryptPassword(sourceDevice.password_encrypted);
     const targetPassword = decryptPassword(targetDevice.password_encrypted);
     const windowsClient = new WindowsFileServerClient(
       targetDevice.hostname,
@@ -264,49 +265,81 @@ export class MigrationService {
     );
 
     try {
-      logger.info(`Starting transfer from ${sourceDevice.name}:${sourcePath} to Windows ${targetDevice.name}:${targetPath}`);
+      logger.info(`Setting up Windows gateway for ${sourceDevice.name}:${sourcePath} on ${targetDevice.name}`);
 
-      // Step 1: Create target directory on Windows
-      await windowsClient.createDirectory(targetPath);
+      // Get export info to determine type
+      const exportInfo = await dbGet<{ export_type: string }>(`
+        SELECT export_type FROM exports WHERE export_path = ? AND device_id = ?
+      `, [sourcePath, sourceDevice.id]);
 
-      // Step 2: Create SMB share for the target path (if not exists)
-      const shareName = targetPath.split('\\').filter(Boolean).pop() || 'share';
-      try {
-        await windowsClient.createSmbShare(shareName, targetPath, `Migrated from ${sourceDevice.name}`);
-        logger.info(`Created SMB share: ${shareName} at ${targetPath}`);
-      } catch (error: any) {
-        // Share might already exist, log and continue
-        logger.warn(`Share creation warning: ${error.message}`);
-      }
+      const exportType = (exportInfo?.export_type || 'smb') as 'nfs' | 'smb' | 'both';
 
-      // Step 3: Determine source access method and transfer data
-      let bytesTransferred = 0;
+      // Step 1: Mount source share on Windows server
+      // This makes Windows act as a proxy/gateway - no data is copied
+      let mountType: 'nfs' | 'smb' = 'smb';
 
+      // Prefer NFS for Isilon/PowerScale, SMB for PowerStore
       if (sourceDevice.type === 'isilon' || sourceDevice.type === 'powerscale') {
-        // For Isilon/PowerScale, use NFS mount and robocopy
-        bytesTransferred = await this.transferFromNFS(
-          sourceDevice,
-          sourcePath,
-          windowsClient,
-          targetPath,
-          migrationId
-        );
-      } else if (sourceDevice.type === 'powerstore') {
-        // For PowerStore, use SMB or NFS based on export type
-        bytesTransferred = await this.transferFromPowerStore(
-          sourceDevice,
-          sourcePath,
-          windowsClient,
-          targetPath,
-          migrationId
-        );
+        mountType = 'nfs';
       }
 
-      logger.info(`Successfully transferred ${bytesTransferred} bytes to Windows`);
-      return bytesTransferred;
+      const mountConfig = {
+        sourceHostname: sourceDevice.hostname,
+        sourcePath: sourcePath,
+        sourceType: mountType,
+        sourceUsername: mountType === 'smb' ? sourceDevice.username : undefined,
+        sourcePassword: mountType === 'smb' ? sourcePassword : undefined,
+        persistent: true // Persist mount across reboots
+      };
+
+      logger.info(`Mounting ${mountType.toUpperCase()} share from ${sourceDevice.hostname}:${sourcePath}`);
+      const mountResult = await windowsClient.mountRemoteShare(mountConfig);
+
+      if (!mountResult.success) {
+        throw new Error(`Failed to mount source share`);
+      }
+
+      logger.info(`Successfully mounted to ${mountResult.mountPoint}`);
+
+      // Step 2: Create proxy share on Windows that re-exports the mounted path
+      // Clients will connect to Windows, which transparently serves data from source
+      const shareName = sourcePath.split('/').filter(Boolean).pop() || 'share';
+      const description = `Gateway share for ${sourceDevice.name}:${sourcePath}`;
+
+      logger.info(`Creating proxy share: ${shareName} pointing to ${mountResult.mountPoint}`);
+
+      const proxyResult = await windowsClient.createProxyShare(
+        shareName,
+        mountResult.mountPoint,
+        exportType,
+        description,
+        {
+          fullAccess: ['Everyone'], // Can be customized
+          encryptData: false
+        }
+      );
+
+      if (!proxyResult.success) {
+        logger.warn(`Some proxy shares failed to create`);
+      }
+
+      // Step 3: Report completion
+      // No bytes transferred since we're proxying, not copying
+      // Return a nominal value to indicate success
+      logger.info(`Successfully configured Windows gateway for ${sourcePath}`);
+
+      broadcastMessage({
+        type: 'migration_progress',
+        migrationId,
+        message: `Windows gateway configured: ${shareName} -> ${sourceDevice.name}:${sourcePath}`,
+        progress: 100
+      });
+
+      // Return 0 bytes since no data was actually transferred
+      return 0;
 
     } catch (error) {
-      logger.error(`Failed to transfer to Windows: ${error}`);
+      logger.error(`Failed to configure Windows gateway: ${error}`);
       throw error;
     }
   }

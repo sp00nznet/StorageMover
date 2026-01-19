@@ -387,9 +387,14 @@ function Migrations() {
                     }
                   />
                   {devices.find((d) => d.id === formData.targetDeviceId)?.type === 'windows' && (
-                    <p className="text-xs text-gray-500 mt-1">
-                      For Windows: Shares will be created and data will be migrated automatically
-                    </p>
+                    <div className="mt-2 p-3 bg-blue-50 border border-blue-200 rounded-md">
+                      <p className="text-xs font-semibold text-blue-900 mb-1">🔄 Windows Gateway Mode</p>
+                      <p className="text-xs text-blue-700">
+                        Windows will mount source shares and re-export them. <strong>No data is copied</strong> -
+                        Windows acts as a storage proxy/gateway. Clients connect to Windows, which
+                        transparently serves data from the source device.
+                      </p>
+                    </div>
                   )}
                 </div>
 

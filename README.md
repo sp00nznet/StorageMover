@@ -94,15 +94,21 @@ Connect to your storage systems:
 ### 2. Discover Exports
 Scan devices to find NFS exports and SMB shares
 
-### 3. Migrate to Windows (New!)
-**Automatic share creation and data migration:**
-- Select source device and exports
+### 3. Windows Storage Gateway Mode (New!) 🔄
+**Windows acts as a transparent storage proxy - NO data migration:**
+- Select source device (Isilon/PowerScale/PowerStore) and shares
 - Choose Windows File Server as target
-- Configure SMB/NFS settings
-- App creates shares AND migrates data automatically
+- Windows automatically:
+  - **Mounts** source shares via NFS/SMB
+  - **Re-exports** them as Windows SMB/NFS shares
+  - **Proxies** all client requests to source storage
+- **Zero data duplication** - Windows is just a gateway
+- Perfect for network segmentation: `Clients → Windows → Source`
 
-### 4. Create Migration
-Select source exports and target device, then start migration
+**Use Case:** Clients can't access source storage directly, but can reach Windows server.
+
+### 4. Create Standard Migration
+Select source exports and target device (PowerScale/PowerStore), then start data migration
 
 ### 5. Monitor Progress
 Track real-time progress with WebSocket updates and detailed logs

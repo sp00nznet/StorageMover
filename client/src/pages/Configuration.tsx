@@ -371,7 +371,8 @@ function Configuration() {
             <h2 className="text-lg font-semibold">Windows File Server</h2>
           </div>
           <p className="text-sm text-gray-500 mb-4">
-            Export shares from storage devices to Windows file servers with exact configuration
+            Create Windows storage gateway: mount source shares and re-export them via SMB/NFS.
+            <strong> No data migration</strong> - Windows acts as a transparent proxy.
           </p>
 
           <div className="space-y-4">
