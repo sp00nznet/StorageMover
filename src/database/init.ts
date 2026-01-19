@@ -31,11 +31,11 @@ export async function initDatabase(): Promise<void> {
       updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
-    -- Storage devices table (Isilon, PowerScale, PowerStore)
+    -- Storage devices table (Isilon, PowerScale, PowerStore, Windows)
     CREATE TABLE IF NOT EXISTS devices (
       id TEXT PRIMARY KEY,
       name TEXT NOT NULL,
-      type TEXT NOT NULL CHECK (type IN ('isilon', 'powerscale', 'powerstore')),
+      type TEXT NOT NULL CHECK (type IN ('isilon', 'powerscale', 'powerstore', 'windows')),
       hostname TEXT NOT NULL,
       port INTEGER DEFAULT 8080,
       username TEXT NOT NULL,
