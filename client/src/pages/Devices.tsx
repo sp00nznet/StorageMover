@@ -15,7 +15,7 @@ import {
 interface Device {
   id: string;
   name: string;
-  type: 'isilon' | 'powerscale' | 'powerstore';
+  type: 'isilon' | 'powerscale' | 'powerstore' | 'windows';
   hostname: string;
   port: number;
   username: string;
@@ -32,7 +32,7 @@ function Devices() {
 
   const [formData, setFormData] = useState({
     name: '',
-    type: 'isilon' as 'isilon' | 'powerscale' | 'powerstore',
+    type: 'isilon' as 'isilon' | 'powerscale' | 'powerstore' | 'windows',
     hostname: '',
     port: '8080',
     username: '',
@@ -123,6 +123,8 @@ function Devices() {
         return 'bg-green-100 text-green-800';
       case 'powerstore':
         return 'bg-purple-100 text-purple-800';
+      case 'windows':
+        return 'bg-sky-100 text-sky-800';
       default:
         return 'bg-gray-100 text-gray-800';
     }
@@ -152,7 +154,7 @@ function Devices() {
       <div className="flex items-center justify-between mb-8">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Storage Devices</h1>
-          <p className="text-gray-600">Manage your Isilon, PowerScale, and PowerStore devices</p>
+          <p className="text-gray-600">Manage your Isilon, PowerScale, PowerStore, and Windows file server devices</p>
         </div>
         <button onClick={() => setShowModal(true)} className="btn-primary flex items-center gap-2">
           <Plus className="h-5 w-5" />
@@ -259,6 +261,7 @@ function Devices() {
                     <option value="isilon">Dell EMC Isilon</option>
                     <option value="powerscale">Dell PowerScale</option>
                     <option value="powerstore">Dell PowerStore</option>
+                    <option value="windows">Windows File Server</option>
                   </select>
                 </div>
                 <div className="grid grid-cols-3 gap-4">

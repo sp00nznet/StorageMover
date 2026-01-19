@@ -6,6 +6,7 @@ import { authenticateToken } from './auth';
 import { decryptPassword } from '../utils/crypto';
 import { PowerScaleClient, MigrationConfig } from '../services/powerscale';
 import { PowerStoreClient } from '../services/powerstore';
+import { WindowsFileServerClient, WindowsExportConfig } from '../services/windows';
 
 export const configRouter = Router();
 
@@ -198,6 +199,156 @@ configRouter.post('/powerstore/import', async (req: Request, res: Response) => {
   }
 });
 
+// Generate Windows file server configuration script
+configRouter.post('/windows/generate', async (req: Request, res: Response) => {
+  try {
+    const { targetDeviceId, exportIds, targetBasePath, smbSettings, nfsSettings } = req.body;
+
+    if (!targetDeviceId || !exportIds?.length) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const targetDevice = await dbGet<Device>('SELECT * FROM devices WHERE id = ?', [targetDeviceId]);
+    if (!targetDevice || targetDevice.type !== 'windows') {
+      return res.status(400).json({ error: 'Target device must be a Windows file server' });
+    }
+
+    // Get source exports with additional details
+    const exports = await dbAll<{
+      export_path: string;
+      export_type: string;
+      clients: string;
+      permissions: string;
+      description: string;
+    }>(`
+      SELECT export_path, export_type, clients, permissions, description
+      FROM exports
+      WHERE id IN (${exportIds.map(() => '?').join(',')})
+    `, exportIds);
+
+    const config: WindowsExportConfig = {
+      sourceExports: exports.map(e => ({
+        path: e.export_path,
+        type: e.export_type as 'nfs' | 'smb' | 'both',
+        clients: e.clients ? JSON.parse(e.clients) : ['*'],
+        permissions: e.permissions,
+        description: e.description
+      })),
+      targetBasePath: targetBasePath || 'C:\\Shares',
+      smbSettings: {
+        fullAccess: smbSettings?.fullAccess || ['Everyone'],
+        changeAccess: smbSettings?.changeAccess || [],
+        readAccess: smbSettings?.readAccess || [],
+        noAccess: smbSettings?.noAccess || [],
+        cachingMode: smbSettings?.cachingMode || 'Manual',
+        encryptData: smbSettings?.encryptData || false
+      },
+      nfsSettings: nfsSettings || {
+        allowRootAccess: false,
+        enableUnmappedAccess: true,
+        authentication: ['sys', 'krb5', 'krb5i']
+      }
+    };
+
+    const password = decryptPassword(targetDevice.password_encrypted);
+    const client = new WindowsFileServerClient(
+      targetDevice.hostname,
+      targetDevice.port,
+      targetDevice.username,
+      password
+    );
+
+    const script = await client.generateExportScript(config);
+
+    // Save configuration
+    const configId = uuidv4();
+    await dbRun(`
+      INSERT INTO config_exports (id, device_id, config_type, config_data)
+      VALUES (?, ?, 'windows_export', ?)
+    `, [configId, targetDeviceId, script]);
+
+    res.json({
+      configId,
+      script,
+      exportCount: exports.length
+    });
+  } catch (error) {
+    logger.error('Failed to generate Windows config:', error);
+    res.status(500).json({ error: 'Failed to generate configuration' });
+  }
+});
+
+// Apply Windows file server configuration directly
+configRouter.post('/windows/apply', async (req: Request, res: Response) => {
+  try {
+    const { targetDeviceId, exportIds, targetBasePath, smbSettings, nfsSettings } = req.body;
+
+    if (!targetDeviceId || !exportIds?.length) {
+      return res.status(400).json({ error: 'Missing required fields' });
+    }
+
+    const targetDevice = await dbGet<Device>('SELECT * FROM devices WHERE id = ?', [targetDeviceId]);
+    if (!targetDevice || targetDevice.type !== 'windows') {
+      return res.status(400).json({ error: 'Target device must be a Windows file server' });
+    }
+
+    // Get source exports with additional details
+    const exports = await dbAll<{
+      export_path: string;
+      export_type: string;
+      clients: string;
+      permissions: string;
+      description: string;
+    }>(`
+      SELECT export_path, export_type, clients, permissions, description
+      FROM exports
+      WHERE id IN (${exportIds.map(() => '?').join(',')})
+    `, exportIds);
+
+    const config: WindowsExportConfig = {
+      sourceExports: exports.map(e => ({
+        path: e.export_path,
+        type: e.export_type as 'nfs' | 'smb' | 'both',
+        clients: e.clients ? JSON.parse(e.clients) : ['*'],
+        permissions: e.permissions,
+        description: e.description
+      })),
+      targetBasePath: targetBasePath || 'C:\\Shares',
+      smbSettings: {
+        fullAccess: smbSettings?.fullAccess || ['Everyone'],
+        changeAccess: smbSettings?.changeAccess || [],
+        readAccess: smbSettings?.readAccess || [],
+        noAccess: smbSettings?.noAccess || [],
+        cachingMode: smbSettings?.cachingMode || 'Manual',
+        encryptData: smbSettings?.encryptData || false
+      },
+      nfsSettings: nfsSettings || {
+        allowRootAccess: false,
+        enableUnmappedAccess: true,
+        authentication: ['sys', 'krb5', 'krb5i']
+      }
+    };
+
+    const password = decryptPassword(targetDevice.password_encrypted);
+    const client = new WindowsFileServerClient(
+      targetDevice.hostname,
+      targetDevice.port,
+      targetDevice.username,
+      password
+    );
+
+    const result = await client.applyExportConfig(config);
+
+    res.json({
+      success: result.success,
+      results: result.results
+    });
+  } catch (error) {
+    logger.error('Failed to apply Windows config:', error);
+    res.status(500).json({ error: 'Failed to apply configuration' });
+  }
+});
+
 // Get saved configurations
 configRouter.get('/saved', async (req: Request, res: Response) => {
   try {
@@ -265,7 +416,13 @@ configRouter.get('/download/:id', async (req: Request, res: Response) => {
       return res.status(404).json({ error: 'Configuration not found' });
     }
 
-    const filename = `storagemover_config_${config.config_type}_${new Date().toISOString().split('T')[0]}.${config.config_type.includes('powerstore') ? 'json' : 'sh'}`;
+    let extension = 'sh';
+    if (config.config_type.includes('powerstore')) {
+      extension = 'json';
+    } else if (config.config_type.includes('windows')) {
+      extension = 'ps1';
+    }
+    const filename = `storagemover_config_${config.config_type}_${new Date().toISOString().split('T')[0]}.${extension}`;
 
     res.setHeader('Content-Type', 'application/octet-stream');
     res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);

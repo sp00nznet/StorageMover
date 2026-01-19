@@ -348,9 +348,9 @@ function Migrations() {
                       required
                     >
                       <option value="">Select source...</option>
-                      {devices.filter((d) => d.type === 'isilon').map((device) => (
+                      {devices.filter((d) => ['isilon', 'powerscale', 'powerstore'].includes(d.type)).map((device) => (
                         <option key={device.id} value={device.id}>
-                          {device.name} (Isilon)
+                          {device.name} ({device.type.toUpperCase()})
                         </option>
                       ))}
                     </select>
@@ -364,9 +364,9 @@ function Migrations() {
                       required
                     >
                       <option value="">Select target...</option>
-                      {devices.filter((d) => d.type === 'powerscale').map((device) => (
+                      {devices.filter((d) => ['powerscale', 'powerstore', 'windows'].includes(d.type)).map((device) => (
                         <option key={device.id} value={device.id}>
-                          {device.name} (PowerScale)
+                          {device.name} ({device.type === 'windows' ? 'Windows' : device.type.toUpperCase()})
                         </option>
                       ))}
                     </select>
@@ -380,8 +380,22 @@ function Migrations() {
                     value={formData.targetBasePath}
                     onChange={(e) => setFormData({ ...formData, targetBasePath: e.target.value })}
                     className="input"
-                    placeholder="/ifs/migrated"
+                    placeholder={
+                      devices.find((d) => d.id === formData.targetDeviceId)?.type === 'windows'
+                        ? 'C:\\Shares'
+                        : '/ifs/migrated'
+                    }
                   />
+                  {devices.find((d) => d.id === formData.targetDeviceId)?.type === 'windows' && (
+                    <div className="mt-2 p-3 bg-blue-50 border border-blue-200 rounded-md">
+                      <p className="text-xs font-semibold text-blue-900 mb-1">🔄 Windows Gateway Mode</p>
+                      <p className="text-xs text-blue-700">
+                        Windows will mount source shares and re-export them. <strong>No data is copied</strong> -
+                        Windows acts as a storage proxy/gateway. Clients connect to Windows, which
+                        transparently serves data from the source device.
+                      </p>
+                    </div>
+                  )}
                 </div>
 
                 {formData.sourceDeviceId && (

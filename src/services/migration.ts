@@ -3,6 +3,7 @@ import { dbGet, dbAll, dbRun } from '../database/init';
 import { logger } from '../utils/logger';
 import { decryptPassword } from '../utils/crypto';
 import { broadcastMessage } from '../websocket/handler';
+import { WindowsFileServerClient } from './windows';
 
 interface Device {
   id: string;
@@ -163,6 +164,21 @@ export class MigrationService {
     targetPath: string,
     migrationId: string
   ): Promise<number> {
+    // Route to appropriate transfer method based on target device type
+    if (targetDevice.type === 'windows') {
+      return this.transferToWindows(sourceDevice, targetDevice, sourcePath, targetPath, migrationId);
+    } else {
+      return this.transferBetweenStorageDevices(sourceDevice, targetDevice, sourcePath, targetPath, migrationId);
+    }
+  }
+
+  private async transferBetweenStorageDevices(
+    sourceDevice: Device,
+    targetDevice: Device,
+    sourcePath: string,
+    targetPath: string,
+    migrationId: string
+  ): Promise<number> {
     const sourcePassword = decryptPassword(sourceDevice.password_encrypted);
     const targetPassword = decryptPassword(targetDevice.password_encrypted);
 
@@ -230,6 +246,191 @@ export class MigrationService {
     } finally {
       ssh.dispose();
     }
+  }
+
+  private async transferToWindows(
+    sourceDevice: Device,
+    targetDevice: Device,
+    sourcePath: string,
+    targetPath: string,
+    migrationId: string
+  ): Promise<number> {
+    const sourcePassword = decryptPassword(sourceDevice.password_encrypted);
+    const targetPassword = decryptPassword(targetDevice.password_encrypted);
+    const windowsClient = new WindowsFileServerClient(
+      targetDevice.hostname,
+      targetDevice.port,
+      targetDevice.username,
+      targetPassword
+    );
+
+    try {
+      logger.info(`Setting up Windows gateway for ${sourceDevice.name}:${sourcePath} on ${targetDevice.name}`);
+
+      // Get export info to determine type
+      const exportInfo = await dbGet<{ export_type: string }>(`
+        SELECT export_type FROM exports WHERE export_path = ? AND device_id = ?
+      `, [sourcePath, sourceDevice.id]);
+
+      const exportType = (exportInfo?.export_type || 'smb') as 'nfs' | 'smb' | 'both';
+
+      // Step 1: Mount source share on Windows server
+      // This makes Windows act as a proxy/gateway - no data is copied
+      let mountType: 'nfs' | 'smb' = 'smb';
+
+      // Prefer NFS for Isilon/PowerScale, SMB for PowerStore
+      if (sourceDevice.type === 'isilon' || sourceDevice.type === 'powerscale') {
+        mountType = 'nfs';
+      }
+
+      const mountConfig = {
+        sourceHostname: sourceDevice.hostname,
+        sourcePath: sourcePath,
+        sourceType: mountType,
+        sourceUsername: mountType === 'smb' ? sourceDevice.username : undefined,
+        sourcePassword: mountType === 'smb' ? sourcePassword : undefined,
+        persistent: true // Persist mount across reboots
+      };
+
+      logger.info(`Mounting ${mountType.toUpperCase()} share from ${sourceDevice.hostname}:${sourcePath}`);
+      const mountResult = await windowsClient.mountRemoteShare(mountConfig);
+
+      if (!mountResult.success) {
+        throw new Error(`Failed to mount source share`);
+      }
+
+      logger.info(`Successfully mounted to ${mountResult.mountPoint}`);
+
+      // Step 2: Create proxy share on Windows that re-exports the mounted path
+      // Clients will connect to Windows, which transparently serves data from source
+      const shareName = sourcePath.split('/').filter(Boolean).pop() || 'share';
+      const description = `Gateway share for ${sourceDevice.name}:${sourcePath}`;
+
+      logger.info(`Creating proxy share: ${shareName} pointing to ${mountResult.mountPoint}`);
+
+      const proxyResult = await windowsClient.createProxyShare(
+        shareName,
+        mountResult.mountPoint,
+        exportType,
+        description,
+        {
+          fullAccess: ['Everyone'], // Can be customized
+          encryptData: false
+        }
+      );
+
+      if (!proxyResult.success) {
+        logger.warn(`Some proxy shares failed to create`);
+      }
+
+      // Step 3: Report completion
+      // No bytes transferred since we're proxying, not copying
+      // Return a nominal value to indicate success
+      logger.info(`Successfully configured Windows gateway for ${sourcePath}`);
+
+      broadcastMessage({
+        type: 'migration_progress',
+        migrationId,
+        message: `Windows gateway configured: ${shareName} -> ${sourceDevice.name}:${sourcePath}`,
+        progress: 100
+      });
+
+      // Return 0 bytes since no data was actually transferred
+      return 0;
+
+    } catch (error) {
+      logger.error(`Failed to configure Windows gateway: ${error}`);
+      throw error;
+    }
+  }
+
+  private async transferFromNFS(
+    sourceDevice: Device,
+    sourcePath: string,
+    windowsClient: WindowsFileServerClient,
+    targetPath: string,
+    migrationId: string
+  ): Promise<number> {
+    // Use PowerShell to mount NFS share and copy data with robocopy
+    const mountPath = `\\\\${sourceDevice.hostname}${sourcePath.replace(/\//g, '\\')}`;
+
+    const script = `
+      # Mount source as NFS if needed or access via UNC path
+      $sourcePath = "${mountPath}"
+      $targetPath = "${targetPath}"
+
+      # Try to access source directly (if accessible via SMB/NFS client)
+      if (Test-Path $sourcePath) {
+        Write-Output "Source accessible at $sourcePath"
+      } else {
+        # Mount NFS share
+        $nfsPath = "${sourceDevice.hostname}:${sourcePath}"
+        Write-Output "Mounting NFS: $nfsPath"
+        Mount-NfsShare -Path $nfsPath -LocalPath "Z:" -Persist $false
+        $sourcePath = "Z:\\"
+      }
+
+      # Use robocopy for data transfer with progress
+      $robocopyArgs = @(
+        $sourcePath,
+        $targetPath,
+        "/E",           # Copy subdirectories, including empty ones
+        "/COPY:DAT",    # Copy data, attributes, timestamps
+        "/R:3",         # Retry 3 times on failed copies
+        "/W:5",         # Wait 5 seconds between retries
+        "/MT:8",        # Multi-threaded (8 threads)
+        "/NP",          # No progress percentage in log
+        "/BYTES"        # Show sizes in bytes
+      )
+
+      $result = robocopy @robocopyArgs
+
+      # Unmount if we mounted
+      if (Test-Path "Z:\\") {
+        Dismount-NfsShare -Path "Z:" -Force
+      }
+
+      # Calculate total size transferred
+      $size = (Get-ChildItem -Path $targetPath -Recurse -File | Measure-Object -Property Length -Sum).Sum
+      if ($null -eq $size) { $size = 0 }
+
+      Write-Output "BYTES_TRANSFERRED:$size"
+    `;
+
+    try {
+      // Execute via PowerShell remoting (will be implemented in WindowsFileServerClient)
+      const result = await (windowsClient as any).executePowerShell(script);
+
+      // Parse bytes transferred from output
+      const match = result.match(/BYTES_TRANSFERRED:(\d+)/);
+      const bytes = match ? parseInt(match[1]) : 0;
+
+      broadcastMessage({
+        type: 'transfer_progress',
+        migrationId,
+        path: sourcePath,
+        progress: 100,
+        bytesTransferred: bytes
+      });
+
+      return bytes;
+
+    } catch (error) {
+      logger.error(`NFS transfer failed: ${error}`);
+      throw error;
+    }
+  }
+
+  private async transferFromPowerStore(
+    sourceDevice: Device,
+    sourcePath: string,
+    windowsClient: WindowsFileServerClient,
+    targetPath: string,
+    migrationId: string
+  ): Promise<number> {
+    // PowerStore exports can be accessed via SMB or NFS
+    // Use similar approach to NFS transfer
+    return this.transferFromNFS(sourceDevice, sourcePath, windowsClient, targetPath, migrationId);
   }
 
   async stopMigration(migrationId: string): Promise<void> {

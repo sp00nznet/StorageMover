@@ -6,6 +6,7 @@ import { authenticateToken } from './auth';
 import { IsilonClient } from '../services/isilon';
 import { PowerScaleClient } from '../services/powerscale';
 import { PowerStoreClient } from '../services/powerstore';
+import { WindowsFileServerClient } from '../services/windows';
 import { encryptPassword, decryptPassword } from '../utils/crypto';
 
 export const deviceRouter = Router();
@@ -16,7 +17,7 @@ deviceRouter.use(authenticateToken);
 interface Device {
   id: string;
   name: string;
-  type: 'isilon' | 'powerscale' | 'powerstore';
+  type: 'isilon' | 'powerscale' | 'powerstore' | 'windows';
   hostname: string;
   port: number;
   username: string;
@@ -62,7 +63,7 @@ deviceRouter.post('/', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    if (!['isilon', 'powerscale', 'powerstore'].includes(type)) {
+    if (!['isilon', 'powerscale', 'powerstore', 'windows'].includes(type)) {
       return res.status(400).json({ error: 'Invalid device type' });
     }
 
@@ -157,6 +158,9 @@ deviceRouter.post('/:id/test', async (req: Request, res: Response) => {
       case 'powerstore':
         client = new PowerStoreClient(device.hostname, device.port, device.username, password);
         break;
+      case 'windows':
+        client = new WindowsFileServerClient(device.hostname, device.port, device.username, password);
+        break;
     }
 
     const connected = await client.testConnection();
@@ -202,6 +206,42 @@ deviceRouter.post('/:id/discover', async (req: Request, res: Response) => {
       case 'powerstore':
         client = new PowerStoreClient(device.hostname, device.port, device.username, password);
         exports = await client.discoverExports();
+        break;
+      case 'windows':
+        client = new WindowsFileServerClient(device.hostname, device.port, device.username, password);
+        // For Windows, list existing SMB and NFS shares
+        const smbShares = await client.listSmbShares();
+        const nfsShares = await client.listNfsShares();
+
+        // Convert SMB shares to export format
+        for (const share of smbShares) {
+          exports.push({
+            path: share.Path || share.path,
+            type: 'smb',
+            clients: ['*'],
+            permissions: 'read-write',
+            description: share.Description || share.description || `SMB Share: ${share.Name || share.name}`,
+            size: 0
+          });
+        }
+
+        // Convert NFS shares to export format
+        for (const share of nfsShares) {
+          const path = share.Path || share.path;
+          const existingIndex = exports.findIndex(e => e.path === path);
+          if (existingIndex >= 0) {
+            exports[existingIndex].type = 'both';
+          } else {
+            exports.push({
+              path: path,
+              type: 'nfs',
+              clients: ['*'],
+              permissions: 'read-write',
+              description: `NFS Share: ${share.Name || share.name}`,
+              size: 0
+            });
+          }
+        }
         break;
     }
 
