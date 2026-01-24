@@ -5,6 +5,7 @@ import {
   Server,
   FolderOutput,
   ArrowRightLeft,
+  Copy,
   Settings,
   LogOut,
   HardDrive
@@ -24,6 +25,7 @@ function Layout() {
     { to: '/devices', icon: Server, label: 'Devices' },
     { to: '/exports', icon: FolderOutput, label: 'Exports' },
     { to: '/migrations', icon: ArrowRightLeft, label: 'Migrations' },
+    { to: '/mount-clones', icon: Copy, label: 'Mount Clones' },
     { to: '/configuration', icon: Settings, label: 'Configuration' }
   ];
 

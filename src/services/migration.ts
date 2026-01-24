@@ -3,7 +3,8 @@ import { dbGet, dbAll, dbRun } from '../database/init';
 import { logger } from '../utils/logger';
 import { decryptPassword } from '../utils/crypto';
 import { broadcastMessage } from '../websocket/handler';
-import { WindowsFileServerClient } from './windows';
+import { WindowsFileServerClient, MountSourceType } from './windows';
+import { mountCloningService } from './mountCloning';
 
 interface Device {
   id: string;
@@ -435,5 +436,77 @@ export class MigrationService {
 
   async stopMigration(migrationId: string): Promise<void> {
     this.activeMigrations.set(migrationId, false);
+  }
+
+  /**
+   * Clone exports to Windows gateway using the mount cloning service
+   * This provides better status tracking and logging than direct transfer
+   */
+  async cloneToWindowsGateway(
+    sourceDeviceId: string,
+    targetDeviceId: string,
+    exportIds: string[],
+    options?: {
+      shareType?: 'nfs' | 'smb' | 'both';
+      persistent?: boolean;
+    }
+  ): Promise<{ success: boolean; results: any[]; summary: { total: number; succeeded: number; failed: number } }> {
+    try {
+      logger.info(`Starting clone operation: ${exportIds.length} exports to Windows gateway`);
+
+      const result = await mountCloningService.cloneExportsBatch(exportIds, targetDeviceId, options);
+
+      // Broadcast overall progress
+      broadcastMessage({
+        type: 'clone_batch_completed',
+        sourceDeviceId,
+        targetDeviceId,
+        summary: result.summary
+      });
+
+      logger.info(`Clone operation completed: ${result.summary.succeeded}/${result.summary.total} succeeded`);
+
+      return {
+        success: result.summary.failed === 0,
+        results: result.results,
+        summary: result.summary
+      };
+
+    } catch (error: any) {
+      logger.error('Clone to Windows gateway failed:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Get source type for mount cloning based on device and export type
+   */
+  private getMountSourceType(deviceType: string, exportType: string): MountSourceType {
+    switch (deviceType) {
+      case 'powerscale':
+        return exportType === 'nfs' ? 'powerscale_nfs' : 'powerscale_smb';
+      case 'isilon':
+        return exportType === 'nfs' ? 'isilon_nfs' : 'isilon_smb';
+      case 'windows':
+        return 'windows_smb';
+      default:
+        // Assume Linux server
+        return exportType === 'nfs' ? 'linux_nfs' : 'linux_smb';
+    }
+  }
+
+  /**
+   * Clone a single export to Windows gateway with full status tracking
+   */
+  async cloneSingleExport(
+    exportId: string,
+    targetDeviceId: string,
+    options?: {
+      shareName?: string;
+      shareType?: 'nfs' | 'smb' | 'both';
+      persistent?: boolean;
+    }
+  ): Promise<{ cloneId: string; success: boolean; error?: string }> {
+    return mountCloningService.cloneFromExport(exportId, targetDeviceId, options);
   }
 }

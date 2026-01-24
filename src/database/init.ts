@@ -15,7 +15,7 @@ if (!fs.existsSync(dataDir)) {
 export const db = new sqlite3.Database(DB_PATH);
 
 // Promisify database methods
-export const dbRun = promisify(db.run.bind(db));
+export const dbRun = promisify(db.run.bind(db)) as (sql: string, params?: any[]) => Promise<void>;
 export const dbGet = promisify(db.get.bind(db)) as <T>(sql: string, params?: any[]) => Promise<T | undefined>;
 export const dbAll = promisify(db.all.bind(db)) as <T>(sql: string, params?: any[]) => Promise<T[]>;
 
@@ -114,11 +114,47 @@ export async function initDatabase(): Promise<void> {
       created_at DATETIME DEFAULT CURRENT_TIMESTAMP
     );
 
+    -- Mount clones table (for tracking cloned mounts on Windows gateway)
+    CREATE TABLE IF NOT EXISTS mount_clones (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      source_type TEXT NOT NULL CHECK (source_type IN ('linux_nfs', 'linux_smb', 'windows_smb', 'powerscale_nfs', 'powerscale_smb', 'isilon_nfs', 'isilon_smb')),
+      source_hostname TEXT NOT NULL,
+      source_path TEXT NOT NULL,
+      source_username TEXT,
+      source_password_encrypted TEXT,
+      target_device_id TEXT NOT NULL,
+      mount_point TEXT,
+      share_name TEXT,
+      share_type TEXT CHECK (share_type IN ('nfs', 'smb', 'both')),
+      status TEXT DEFAULT 'pending' CHECK (status IN ('pending', 'mounting', 'creating_share', 'active', 'failed', 'disconnected', 'removed')),
+      error_message TEXT,
+      persistent INTEGER DEFAULT 1,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      last_health_check DATETIME,
+      FOREIGN KEY (target_device_id) REFERENCES devices(id) ON DELETE CASCADE
+    );
+
+    -- Mount clone logs table (for detailed operation logging)
+    CREATE TABLE IF NOT EXISTS mount_clone_logs (
+      id TEXT PRIMARY KEY,
+      clone_id TEXT NOT NULL,
+      level TEXT NOT NULL CHECK (level IN ('info', 'warn', 'error', 'debug')),
+      message TEXT NOT NULL,
+      details TEXT,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (clone_id) REFERENCES mount_clones(id) ON DELETE CASCADE
+    );
+
     -- Create indexes
     CREATE INDEX IF NOT EXISTS idx_exports_device ON exports(device_id);
     CREATE INDEX IF NOT EXISTS idx_migrations_status ON migrations(status);
     CREATE INDEX IF NOT EXISTS idx_migration_items_migration ON migration_items(migration_id);
     CREATE INDEX IF NOT EXISTS idx_activity_log_created ON activity_log(created_at);
+    CREATE INDEX IF NOT EXISTS idx_mount_clones_target ON mount_clones(target_device_id);
+    CREATE INDEX IF NOT EXISTS idx_mount_clones_status ON mount_clones(status);
+    CREATE INDEX IF NOT EXISTS idx_mount_clone_logs_clone ON mount_clone_logs(clone_id);
   `;
 
   return new Promise((resolve, reject) => {

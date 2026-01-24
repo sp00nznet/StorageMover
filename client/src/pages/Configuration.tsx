@@ -1,13 +1,10 @@
 import { useState, useEffect } from 'react';
 import axios from 'axios';
 import {
-  Settings,
   Download,
   Upload,
   FileCode,
-  Server,
-  CheckCircle,
-  AlertCircle
+  Server
 } from 'lucide-react';
 
 interface Device {

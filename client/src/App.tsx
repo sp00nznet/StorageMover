@@ -6,6 +6,7 @@ import Dashboard from './pages/Dashboard';
 import Devices from './pages/Devices';
 import Exports from './pages/Exports';
 import Migrations from './pages/Migrations';
+import MountClones from './pages/MountClones';
 import Configuration from './pages/Configuration';
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -42,6 +43,7 @@ function App() {
         <Route path="devices" element={<Devices />} />
         <Route path="exports" element={<Exports />} />
         <Route path="migrations" element={<Migrations />} />
+        <Route path="mount-clones" element={<MountClones />} />
         <Route path="configuration" element={<Configuration />} />
       </Route>
     </Routes>

@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import axios from 'axios';
+import { Link } from 'react-router-dom';
 import {
   ArrowRightLeft,
   Plus,
@@ -10,7 +11,9 @@ import {
   CheckCircle,
   Clock,
   AlertCircle,
-  X
+  X,
+  Copy,
+  ExternalLink
 } from 'lucide-react';
 
 interface Migration {
@@ -388,12 +391,20 @@ function Migrations() {
                   />
                   {devices.find((d) => d.id === formData.targetDeviceId)?.type === 'windows' && (
                     <div className="mt-2 p-3 bg-blue-50 border border-blue-200 rounded-md">
-                      <p className="text-xs font-semibold text-blue-900 mb-1">🔄 Windows Gateway Mode</p>
-                      <p className="text-xs text-blue-700">
+                      <p className="text-xs font-semibold text-blue-900 mb-1">Windows Gateway Mode</p>
+                      <p className="text-xs text-blue-700 mb-2">
                         Windows will mount source shares and re-export them. <strong>No data is copied</strong> -
                         Windows acts as a storage proxy/gateway. Clients connect to Windows, which
                         transparently serves data from the source device.
                       </p>
+                      <Link
+                        to="/mount-clones"
+                        className="inline-flex items-center gap-1 text-xs font-medium text-dell-blue hover:underline"
+                      >
+                        <Copy className="h-3 w-3" />
+                        Use Mount Clones for advanced cloning with status tracking
+                        <ExternalLink className="h-3 w-3" />
+                      </Link>
                     </div>
                   )}
                 </div>

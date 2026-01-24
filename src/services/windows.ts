@@ -12,6 +12,47 @@ export interface WindowsShare {
   permissions: any;
 }
 
+export type MountSourceType = 'linux_nfs' | 'linux_smb' | 'windows_smb' | 'powerscale_nfs' | 'powerscale_smb' | 'isilon_nfs' | 'isilon_smb';
+
+export interface MountCloneConfig {
+  name: string;
+  sourceType: MountSourceType;
+  sourceHostname: string;
+  sourcePath: string;
+  sourceUsername?: string;
+  sourcePassword?: string;
+  shareName?: string;
+  shareType?: 'nfs' | 'smb' | 'both';
+  persistent?: boolean;
+  smbSettings?: WindowsExportConfig['smbSettings'];
+  nfsSettings?: WindowsExportConfig['nfsSettings'];
+}
+
+export interface MountCloneResult {
+  success: boolean;
+  mountPoint?: string;
+  shareName?: string;
+  shareType?: 'nfs' | 'smb' | 'both';
+  error?: string;
+  logs: MountCloneLog[];
+}
+
+export interface MountCloneLog {
+  level: 'info' | 'warn' | 'error' | 'debug';
+  message: string;
+  details?: string;
+  timestamp: Date;
+}
+
+export interface MountHealthStatus {
+  accessible: boolean;
+  mountPoint: string;
+  remotePath: string;
+  shareActive: boolean;
+  lastChecked: Date;
+  error?: string;
+}
+
 export interface MountConfig {
   sourceHostname: string;
   sourcePath: string;
@@ -805,5 +846,444 @@ try {
 
     const allSuccess = results.every(r => r.success);
     return { success: allSuccess, results };
+  }
+
+  /**
+   * Clone a mount from any source (Linux NFS, Linux Samba, Windows SMB, PowerScale, Isilon)
+   * to this Windows gateway server. This mounts the source and re-exports it as a Windows share.
+   */
+  async cloneMount(config: MountCloneConfig): Promise<MountCloneResult> {
+    const logs: MountCloneLog[] = [];
+    const addLog = (level: MountCloneLog['level'], message: string, details?: string) => {
+      logs.push({ level, message, details, timestamp: new Date() });
+      if (level === 'error') {
+        logger.error(`[MountClone] ${message}`, details);
+      } else if (level === 'warn') {
+        logger.warn(`[MountClone] ${message}`, details);
+      } else {
+        logger.info(`[MountClone] ${message}`);
+      }
+    };
+
+    try {
+      addLog('info', `Starting mount clone: ${config.name}`);
+      addLog('info', `Source: ${config.sourceType} - ${config.sourceHostname}:${config.sourcePath}`);
+
+      // Determine mount type based on source type
+      let mountType: 'nfs' | 'smb';
+      switch (config.sourceType) {
+        case 'linux_nfs':
+        case 'powerscale_nfs':
+        case 'isilon_nfs':
+          mountType = 'nfs';
+          break;
+        case 'linux_smb':
+        case 'windows_smb':
+        case 'powerscale_smb':
+        case 'isilon_smb':
+          mountType = 'smb';
+          break;
+        default:
+          throw new Error(`Unknown source type: ${config.sourceType}`);
+      }
+
+      addLog('info', `Mount type determined: ${mountType.toUpperCase()}`);
+
+      // Step 1: Mount the remote share
+      const mountConfig: MountConfig = {
+        sourceHostname: config.sourceHostname,
+        sourcePath: config.sourcePath,
+        sourceType: mountType,
+        sourceUsername: config.sourceUsername,
+        sourcePassword: config.sourcePassword,
+        persistent: config.persistent !== false
+      };
+
+      addLog('info', `Mounting remote ${mountType.toUpperCase()} share...`);
+      const mountResult = await this.mountRemoteShare(mountConfig);
+
+      if (!mountResult.success) {
+        addLog('error', 'Failed to mount remote share', 'Mount operation returned failure');
+        return { success: false, error: 'Failed to mount remote share', logs };
+      }
+
+      addLog('info', `Successfully mounted to ${mountResult.mountPoint}`);
+
+      // Step 2: Create proxy shares to re-export the mount
+      const shareName = config.shareName || this.generateShareName(config.sourcePath);
+      const shareType = config.shareType || 'smb';
+      const description = `Gateway clone: ${config.sourceHostname}:${config.sourcePath}`;
+
+      addLog('info', `Creating proxy share: ${shareName} (${shareType})`);
+
+      const proxyResult = await this.createProxyShare(
+        shareName,
+        mountResult.mountPoint,
+        shareType,
+        description,
+        config.smbSettings || { fullAccess: ['Everyone'] }
+      );
+
+      if (!proxyResult.success) {
+        addLog('warn', 'Some proxy shares failed to create', JSON.stringify(proxyResult.results));
+      } else {
+        addLog('info', `Proxy share created successfully`);
+      }
+
+      // Log detailed results
+      for (const result of proxyResult.results) {
+        if (result.success) {
+          addLog('info', `${result.action} completed`, JSON.stringify(result));
+        } else {
+          addLog('error', `${result.action} failed`, result.error);
+        }
+      }
+
+      addLog('info', `Mount clone completed: ${shareName}`);
+
+      return {
+        success: true,
+        mountPoint: mountResult.mountPoint,
+        shareName,
+        shareType,
+        logs
+      };
+
+    } catch (error: any) {
+      addLog('error', `Mount clone failed: ${error.message}`, error.stack);
+      return {
+        success: false,
+        error: error.message,
+        logs
+      };
+    }
+  }
+
+  /**
+   * Clone multiple mounts in batch
+   */
+  async cloneMountsBatch(configs: MountCloneConfig[]): Promise<{ results: MountCloneResult[]; summary: { total: number; succeeded: number; failed: number } }> {
+    const results: MountCloneResult[] = [];
+    let succeeded = 0;
+    let failed = 0;
+
+    for (const config of configs) {
+      const result = await this.cloneMount(config);
+      results.push(result);
+      if (result.success) {
+        succeeded++;
+      } else {
+        failed++;
+      }
+    }
+
+    return {
+      results,
+      summary: {
+        total: configs.length,
+        succeeded,
+        failed
+      }
+    };
+  }
+
+  /**
+   * Check health status of a cloned mount
+   */
+  async checkMountHealth(mountPoint: string, shareName: string): Promise<MountHealthStatus> {
+    try {
+      const script = `
+        $result = @{
+          accessible = $false
+          mountPoint = "${mountPoint}"
+          remotePath = ""
+          shareActive = $false
+          error = $null
+        }
+
+        # Check if mount point is accessible
+        try {
+          if (Test-Path "${mountPoint}") {
+            $result.accessible = $true
+
+            # Get remote path for network drive
+            $drive = Get-PSDrive -Name "${mountPoint.replace(':', '')}" -ErrorAction SilentlyContinue
+            if ($drive -and $drive.DisplayRoot) {
+              $result.remotePath = $drive.DisplayRoot
+            }
+          }
+        } catch {
+          $result.error = $_.Exception.Message
+        }
+
+        # Check if share is active
+        try {
+          $share = Get-SmbShare -Name "${shareName}" -ErrorAction SilentlyContinue
+          if ($share) {
+            $result.shareActive = $true
+          }
+        } catch {
+          # Share might not exist or NFS share
+        }
+
+        $result | ConvertTo-Json -Compress
+      `;
+
+      const output = await this.executePowerShell(script);
+      const status = JSON.parse(output);
+
+      return {
+        accessible: status.accessible,
+        mountPoint: status.mountPoint,
+        remotePath: status.remotePath || '',
+        shareActive: status.shareActive,
+        lastChecked: new Date(),
+        error: status.error || undefined
+      };
+
+    } catch (error: any) {
+      return {
+        accessible: false,
+        mountPoint,
+        remotePath: '',
+        shareActive: false,
+        lastChecked: new Date(),
+        error: error.message
+      };
+    }
+  }
+
+  /**
+   * Remove a cloned mount (unmount and remove shares)
+   */
+  async removeClonedMount(mountPoint: string, shareName: string, shareType: 'nfs' | 'smb' | 'both'): Promise<{ success: boolean; logs: MountCloneLog[] }> {
+    const logs: MountCloneLog[] = [];
+    const addLog = (level: MountCloneLog['level'], message: string, details?: string) => {
+      logs.push({ level, message, details, timestamp: new Date() });
+      logger[level === 'debug' ? 'info' : level](`[MountClone] ${message}`);
+    };
+
+    try {
+      addLog('info', `Removing cloned mount: ${mountPoint}, share: ${shareName}`);
+
+      // Step 1: Remove SMB share
+      if (shareType === 'smb' || shareType === 'both') {
+        try {
+          const removeSmb = `
+            $share = Get-SmbShare -Name "${shareName}" -ErrorAction SilentlyContinue
+            if ($share) {
+              Remove-SmbShare -Name "${shareName}" -Force -ErrorAction Stop
+              Write-Output "SMB share removed"
+            } else {
+              Write-Output "SMB share not found"
+            }
+          `;
+          await this.executePowerShell(removeSmb);
+          addLog('info', `SMB share ${shareName} removed`);
+        } catch (error: any) {
+          addLog('warn', `Failed to remove SMB share: ${error.message}`);
+        }
+      }
+
+      // Step 2: Remove NFS share
+      if (shareType === 'nfs' || shareType === 'both') {
+        try {
+          const removeNfs = `
+            $share = Get-NfsShare -Path "${mountPoint}" -ErrorAction SilentlyContinue
+            if ($share) {
+              Remove-NfsShare -Path "${mountPoint}" -Force -ErrorAction Stop
+              Write-Output "NFS share removed"
+            } else {
+              Write-Output "NFS share not found"
+            }
+          `;
+          await this.executePowerShell(removeNfs);
+          addLog('info', `NFS share for ${mountPoint} removed`);
+        } catch (error: any) {
+          addLog('warn', `Failed to remove NFS share: ${error.message}`);
+        }
+      }
+
+      // Step 3: Unmount the drive
+      try {
+        await this.unmountRemoteShare(mountPoint, 'smb');
+        addLog('info', `Mount point ${mountPoint} unmounted`);
+      } catch (error: any) {
+        addLog('warn', `Failed to unmount: ${error.message}`);
+      }
+
+      addLog('info', 'Cloned mount removal completed');
+      return { success: true, logs };
+
+    } catch (error: any) {
+      addLog('error', `Failed to remove cloned mount: ${error.message}`);
+      return { success: false, logs };
+    }
+  }
+
+  /**
+   * List all cloned mounts (network drives with re-exported shares)
+   */
+  async listClonedMounts(): Promise<{ mounts: any[] }> {
+    try {
+      const script = `
+        $clonedMounts = @()
+
+        # Get all network drives
+        $networkDrives = Get-PSDrive -PSProvider FileSystem | Where-Object { $_.DisplayRoot -like '*\\\\*' -or $_.DisplayRoot -like '*:*' }
+
+        foreach ($drive in $networkDrives) {
+          $driveLetter = $drive.Name + ":"
+
+          # Find shares pointing to this drive
+          $relatedShares = Get-SmbShare | Where-Object { $_.Path -like "$driveLetter*" } | Select-Object Name, Path
+
+          $mount = @{
+            mountPoint = $driveLetter
+            remotePath = $drive.DisplayRoot
+            shares = @($relatedShares)
+          }
+
+          $clonedMounts += $mount
+        }
+
+        $clonedMounts | ConvertTo-Json -Depth 3 -Compress
+      `;
+
+      const output = await this.executePowerShell(script);
+
+      try {
+        const parsed = JSON.parse(output);
+        const mounts = Array.isArray(parsed) ? parsed : (parsed ? [parsed] : []);
+        return { mounts };
+      } catch {
+        return { mounts: [] };
+      }
+
+    } catch (error: any) {
+      logger.warn(`Failed to list cloned mounts: ${error.message}`);
+      return { mounts: [] };
+    }
+  }
+
+  /**
+   * Generate a safe share name from a path
+   */
+  private generateShareName(sourcePath: string): string {
+    // Extract the last component of the path and sanitize it
+    const pathParts = sourcePath.replace(/\\/g, '/').split('/').filter(Boolean);
+    const baseName = pathParts[pathParts.length - 1] || 'share';
+
+    // Replace invalid characters and limit length
+    return baseName
+      .replace(/[^a-zA-Z0-9_-]/g, '_')
+      .substring(0, 80);
+  }
+
+  /**
+   * Discover mountable shares from a remote host
+   * Useful for finding what can be cloned from Linux/Windows servers
+   */
+  async discoverRemoteShares(
+    hostname: string,
+    type: 'nfs' | 'smb',
+    username?: string,
+    password?: string
+  ): Promise<{ shares: Array<{ path: string; type: string; description?: string }> }> {
+    try {
+      let script = '';
+
+      if (type === 'smb') {
+        // Discover SMB shares
+        if (username && password) {
+          script = `
+            $securePassword = ConvertTo-SecureString "${password}" -AsPlainText -Force
+            $credential = New-Object System.Management.Automation.PSCredential("${username}", $securePassword)
+
+            try {
+              $shares = net view \\\\${hostname} 2>&1
+              if ($LASTEXITCODE -eq 0) {
+                $shareList = @()
+                $shares | ForEach-Object {
+                  if ($_ -match '^(\\S+)\\s+Disk') {
+                    $shareList += @{
+                      path = "\\\\${hostname}\\" + $Matches[1]
+                      type = "smb"
+                      description = "SMB Share"
+                    }
+                  }
+                }
+                $shareList | ConvertTo-Json -Compress
+              } else {
+                "[]"
+              }
+            } catch {
+              "[]"
+            }
+          `;
+        } else {
+          script = `
+            try {
+              $shares = net view \\\\${hostname} 2>&1
+              if ($LASTEXITCODE -eq 0) {
+                $shareList = @()
+                $shares | ForEach-Object {
+                  if ($_ -match '^(\\S+)\\s+Disk') {
+                    $shareList += @{
+                      path = "\\\\${hostname}\\" + $Matches[1]
+                      type = "smb"
+                      description = "SMB Share"
+                    }
+                  }
+                }
+                $shareList | ConvertTo-Json -Compress
+              } else {
+                "[]"
+              }
+            } catch {
+              "[]"
+            }
+          `;
+        }
+      } else {
+        // Discover NFS exports using showmount
+        script = `
+          try {
+            $exports = showmount -e ${hostname} 2>&1
+            if ($LASTEXITCODE -eq 0) {
+              $exportList = @()
+              $exports | ForEach-Object {
+                if ($_ -match '^(/\\S+)') {
+                  $exportList += @{
+                    path = $Matches[1]
+                    type = "nfs"
+                    description = "NFS Export"
+                  }
+                }
+              }
+              $exportList | ConvertTo-Json -Compress
+            } else {
+              "[]"
+            }
+          } catch {
+            "[]"
+          }
+        `;
+      }
+
+      const output = await this.executePowerShell(script);
+
+      try {
+        const parsed = JSON.parse(output);
+        const shares = Array.isArray(parsed) ? parsed : (parsed ? [parsed] : []);
+        return { shares };
+      } catch {
+        return { shares: [] };
+      }
+
+    } catch (error: any) {
+      logger.warn(`Failed to discover remote shares: ${error.message}`);
+      return { shares: [] };
+    }
   }
 }
