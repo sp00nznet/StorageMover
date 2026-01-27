@@ -271,3 +271,47 @@ migrationRouter.get('/stats/summary', async (req: Request, res: Response) => {
     res.status(500).json({ error: 'Failed to get migration statistics' });
   }
 });
+
+// Clone exports to Windows gateway (alternative to data migration)
+migrationRouter.post('/clone-to-gateway', async (req: Request, res: Response) => {
+  try {
+    const { sourceDeviceId, targetDeviceId, exportIds, shareType, persistent } = req.body;
+
+    if (!sourceDeviceId || !targetDeviceId || !exportIds?.length) {
+      return res.status(400).json({ error: 'Missing required fields: sourceDeviceId, targetDeviceId, exportIds' });
+    }
+
+    // Verify target is Windows
+    const targetDevice = await dbGet<{ type: string }>('SELECT type FROM devices WHERE id = ?', [targetDeviceId]);
+    if (!targetDevice) {
+      return res.status(404).json({ error: 'Target device not found' });
+    }
+    if (targetDevice.type !== 'windows') {
+      return res.status(400).json({ error: 'Target device must be a Windows file server for gateway cloning' });
+    }
+
+    const migrationService = new MigrationService();
+    const result = await migrationService.cloneToWindowsGateway(
+      sourceDeviceId,
+      targetDeviceId,
+      exportIds,
+      { shareType, persistent }
+    );
+
+    logger.info(`Gateway clone completed: ${result.summary.succeeded}/${result.summary.total} succeeded`);
+
+    res.json({
+      success: result.success,
+      summary: result.summary,
+      results: result.results.map(r => ({
+        exportId: r.exportId,
+        cloneId: r.cloneId,
+        success: r.success,
+        error: r.error
+      }))
+    });
+  } catch (error) {
+    logger.error('Failed to clone to gateway:', error);
+    res.status(500).json({ error: 'Failed to clone to gateway' });
+  }
+});

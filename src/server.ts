@@ -12,6 +12,7 @@ import { deviceRouter } from './routes/devices';
 import { exportRouter } from './routes/exports';
 import { migrationRouter } from './routes/migrations';
 import { configRouter } from './routes/config';
+import { mountCloneRouter } from './routes/mountClones';
 import { setupWebSocket } from './websocket/handler';
 
 dotenv.config();
@@ -33,6 +34,7 @@ app.use('/api/devices', deviceRouter);
 app.use('/api/exports', exportRouter);
 app.use('/api/migrations', migrationRouter);
 app.use('/api/config', configRouter);
+app.use('/api/mount-clones', mountCloneRouter);
 
 // Health check
 app.get('/api/health', (req, res) => {
