@@ -1,6 +1,7 @@
 import axios, { AxiosInstance } from 'axios';
 import https from 'https';
 import { logger } from '../utils/logger';
+import { ExportRawConfig, NfsAlias } from './powerscale';
 
 export interface IsilonExport {
   id: string;
@@ -10,6 +11,7 @@ export interface IsilonExport {
   permissions: string;
   description: string;
   size: number;
+  rawConfig?: ExportRawConfig;
 }
 
 export class IsilonClient {
@@ -80,14 +82,33 @@ export class IsilonClient {
       const nfsResponse = await this.client.get('/platform/2/protocols/nfs/exports');
       if (nfsResponse.data.exports) {
         for (const exp of nfsResponse.data.exports) {
+          const path = exp.paths?.[0] || exp.path;
           exports.push({
             id: `nfs-${exp.id}`,
-            path: exp.paths?.[0] || exp.path,
+            path,
             type: 'nfs',
             clients: exp.clients || ['*'],
             permissions: exp.map_root?.enabled ? 'root_squash' : 'no_root_squash',
-            description: exp.description || `NFS Export: ${exp.paths?.[0] || exp.path}`,
-            size: 0
+            description: exp.description || `NFS Export: ${path}`,
+            size: 0,
+            rawConfig: {
+              paths: exp.paths || (exp.path ? [exp.path] : []),
+              clients: exp.clients || [],
+              root_clients: exp.root_clients || [],
+              read_only_clients: exp.read_only_clients || [],
+              read_write_clients: exp.read_write_clients || [],
+              read_only: !!exp.read_only,
+              all_dirs: !!exp.all_dirs,
+              security_flavors: exp.security_flavors || [],
+              map_root: exp.map_root && exp.map_root.enabled
+                ? { enabled: true, user: exp.map_root.user?.name || exp.map_root.user?.id }
+                : { enabled: false },
+              map_all: exp.map_all && exp.map_all.enabled
+                ? { enabled: true, user: exp.map_all.user?.name || exp.map_all.user?.id }
+                : { enabled: false },
+              description: exp.description || '',
+              zone: exp.zone || 'System'
+            }
           });
         }
       }
@@ -104,6 +125,11 @@ export class IsilonClient {
           const existingIndex = exports.findIndex(e => e.path === share.path);
           if (existingIndex >= 0) {
             exports[existingIndex].type = 'both';
+            exports[existingIndex].rawConfig = {
+              ...(exports[existingIndex].rawConfig || {}),
+              smb_name: share.name,
+              smb_browsable: share.browsable !== false
+            };
           } else {
             exports.push({
               id: `smb-${share.id}`,
@@ -112,7 +138,13 @@ export class IsilonClient {
               clients: ['*'],
               permissions: share.permissions?.join(',') || 'read',
               description: share.description || `SMB Share: ${share.name}`,
-              size: 0
+              size: 0,
+              rawConfig: {
+                smb_name: share.name,
+                smb_browsable: share.browsable !== false,
+                description: share.description || '',
+                zone: share.zone || 'System'
+              }
             });
           }
         }
@@ -135,6 +167,26 @@ export class IsilonClient {
 
     logger.info(`Discovered ${exports.length} exports from Isilon ${this.hostname}`);
     return exports;
+  }
+
+  // Discover NFS aliases (short names like /rht that point at a real /ifs path).
+  async discoverAliases(): Promise<NfsAlias[]> {
+    await this.authenticate();
+    const aliases: NfsAlias[] = [];
+    try {
+      const resp = await this.client.get('/platform/2/protocols/nfs/aliases');
+      for (const a of resp.data.aliases || []) {
+        aliases.push({
+          name: a.name,
+          path: a.path,
+          zone: a.zone || 'System',
+          health: a.health
+        });
+      }
+    } catch (error) {
+      logger.warn('Failed to get NFS aliases from Isilon:', error);
+    }
+    return aliases;
   }
 
   async getExportDetails(exportPath: string): Promise<any> {

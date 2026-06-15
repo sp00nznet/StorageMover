@@ -4,13 +4,35 @@ import { dbGet, dbAll, dbRun } from '../database/init';
 import { logger } from '../utils/logger';
 import { authenticateToken } from './auth';
 import { decryptPassword } from '../utils/crypto';
-import { PowerScaleClient, MigrationConfig } from '../services/powerscale';
+import { PowerScaleClient, MigrationConfig, NfsAlias } from '../services/powerscale';
 import { PowerStoreClient } from '../services/powerstore';
 import { WindowsFileServerClient, WindowsExportConfig } from '../services/windows';
 
 export const configRouter = Router();
 
 configRouter.use(authenticateToken);
+
+// Collect NFS aliases for the source device behind a set of selected exports.
+// Prefers an explicit sourceDeviceId; otherwise derives it from the exports'
+// own device_id. Aliases are device-wide, so all of the source's are returned.
+async function getAliasesForExports(
+  exports: { device_id?: string }[],
+  sourceDeviceId?: string
+): Promise<NfsAlias[]> {
+  const deviceIds = new Set<string>();
+  if (sourceDeviceId) deviceIds.add(sourceDeviceId);
+  for (const e of exports) {
+    if (e.device_id) deviceIds.add(e.device_id);
+  }
+  if (deviceIds.size === 0) return [];
+
+  const ids = Array.from(deviceIds);
+  const rows = await dbAll<{ name: string; path: string; zone: string }>(
+    `SELECT name, path, zone FROM nfs_aliases WHERE device_id IN (${ids.map(() => '?').join(',')})`,
+    ids
+  );
+  return rows.map(r => ({ name: r.name, path: r.path, zone: r.zone || 'System' }));
+}
 
 interface Device {
   id: string;
@@ -44,13 +66,21 @@ configRouter.post('/powerscale/generate', async (req: Request, res: Response) =>
       return res.status(400).json({ error: 'Target device must be a PowerScale device' });
     }
 
-    // Get source exports
-    const exports = await dbAll<{ export_path: string; export_type: string }>(`
-      SELECT export_path, export_type FROM exports WHERE id IN (${exportIds.map(() => '?').join(',')})
+    // Get source exports (with full captured config for faithful recreation)
+    const exports = await dbAll<{ export_path: string; export_type: string; raw_config: string | null; device_id: string }>(`
+      SELECT export_path, export_type, raw_config, device_id FROM exports WHERE id IN (${exportIds.map(() => '?').join(',')})
     `, exportIds);
 
+    // Pull NFS aliases for the source device(s) so they migrate too
+    const aliases = await getAliasesForExports(exports, sourceDeviceId);
+
     const config: MigrationConfig = {
-      sourceExports: exports.map(e => ({ path: e.export_path, type: e.export_type })),
+      sourceExports: exports.map(e => ({
+        path: e.export_path,
+        type: e.export_type,
+        rawConfig: e.raw_config ? JSON.parse(e.raw_config) : undefined
+      })),
+      aliases,
       targetBasePath: targetBasePath || '',
       nfsSettings: {
         rootSquash: nfsSettings?.rootSquash ?? true,
@@ -88,7 +118,7 @@ configRouter.post('/powerscale/generate', async (req: Request, res: Response) =>
 // Apply PowerScale configuration directly
 configRouter.post('/powerscale/apply', async (req: Request, res: Response) => {
   try {
-    const { targetDeviceId, exportIds, targetBasePath, nfsSettings, smbSettings } = req.body;
+    const { targetDeviceId, sourceDeviceId, exportIds, targetBasePath, nfsSettings, smbSettings } = req.body;
 
     if (!targetDeviceId || !exportIds?.length) {
       return res.status(400).json({ error: 'Missing required fields' });
@@ -99,13 +129,20 @@ configRouter.post('/powerscale/apply', async (req: Request, res: Response) => {
       return res.status(400).json({ error: 'Target device must be a PowerScale device' });
     }
 
-    // Get source exports
-    const exports = await dbAll<{ export_path: string; export_type: string }>(`
-      SELECT export_path, export_type FROM exports WHERE id IN (${exportIds.map(() => '?').join(',')})
+    // Get source exports (with full captured config for faithful recreation)
+    const exports = await dbAll<{ export_path: string; export_type: string; raw_config: string | null; device_id: string }>(`
+      SELECT export_path, export_type, raw_config, device_id FROM exports WHERE id IN (${exportIds.map(() => '?').join(',')})
     `, exportIds);
 
+    const aliases = await getAliasesForExports(exports, sourceDeviceId);
+
     const config: MigrationConfig = {
-      sourceExports: exports.map(e => ({ path: e.export_path, type: e.export_type })),
+      sourceExports: exports.map(e => ({
+        path: e.export_path,
+        type: e.export_type,
+        rawConfig: e.raw_config ? JSON.parse(e.raw_config) : undefined
+      })),
+      aliases,
       targetBasePath: targetBasePath || '',
       nfsSettings: {
         rootSquash: nfsSettings?.rootSquash ?? true,
