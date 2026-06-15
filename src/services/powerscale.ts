@@ -2,6 +2,27 @@ import axios, { AxiosInstance } from 'axios';
 import https from 'https';
 import { logger } from '../utils/logger';
 
+// Normalized, full-fidelity snapshot of a source export/share so the target
+// can be recreated faithfully (real client lists, RO/RW split, root mapping,
+// security flavors) instead of a generic clients=* export.
+export interface ExportRawConfig {
+  paths?: string[];
+  clients?: string[];
+  root_clients?: string[];
+  read_only_clients?: string[];
+  read_write_clients?: string[];
+  read_only?: boolean;
+  all_dirs?: boolean;
+  security_flavors?: string[];
+  map_root?: { enabled?: boolean; user?: string };
+  map_all?: { enabled?: boolean; user?: string };
+  description?: string;
+  zone?: string;
+  // SMB-only
+  smb_name?: string;
+  smb_browsable?: boolean;
+}
+
 export interface PowerScaleExport {
   id: string;
   path: string;
@@ -10,10 +31,19 @@ export interface PowerScaleExport {
   permissions: string;
   description: string;
   size: number;
+  rawConfig?: ExportRawConfig;
+}
+
+export interface NfsAlias {
+  name: string;
+  path: string;
+  zone?: string;
+  health?: string;
 }
 
 export interface MigrationConfig {
-  sourceExports: { path: string; type: string }[];
+  sourceExports: { path: string; type: string; rawConfig?: ExportRawConfig }[];
+  aliases?: NfsAlias[];
   targetBasePath: string;
   nfsSettings: {
     rootSquash: boolean;
@@ -93,14 +123,33 @@ export class PowerScaleClient {
       const nfsResponse = await this.client.get('/platform/4/protocols/nfs/exports');
       if (nfsResponse.data.exports) {
         for (const exp of nfsResponse.data.exports) {
+          const path = exp.paths?.[0] || exp.path;
           exports.push({
             id: `nfs-${exp.id}`,
-            path: exp.paths?.[0] || exp.path,
+            path,
             type: 'nfs',
             clients: exp.clients || ['*'],
             permissions: exp.root_clients?.length ? 'no_root_squash' : 'root_squash',
-            description: exp.description || `NFS Export: ${exp.paths?.[0] || exp.path}`,
-            size: 0
+            description: exp.description || `NFS Export: ${path}`,
+            size: 0,
+            rawConfig: {
+              paths: exp.paths || (exp.path ? [exp.path] : []),
+              clients: exp.clients || [],
+              root_clients: exp.root_clients || [],
+              read_only_clients: exp.read_only_clients || [],
+              read_write_clients: exp.read_write_clients || [],
+              read_only: !!exp.read_only,
+              all_dirs: !!exp.all_dirs,
+              security_flavors: exp.security_flavors || [],
+              map_root: exp.map_root && exp.map_root.enabled
+                ? { enabled: true, user: exp.map_root.user?.name || exp.map_root.user?.id }
+                : { enabled: false },
+              map_all: exp.map_all && exp.map_all.enabled
+                ? { enabled: true, user: exp.map_all.user?.name || exp.map_all.user?.id }
+                : { enabled: false },
+              description: exp.description || '',
+              zone: exp.zone || 'System'
+            }
           });
         }
       }
@@ -113,9 +162,21 @@ export class PowerScaleClient {
       const smbResponse = await this.client.get('/platform/12/protocols/smb/shares');
       if (smbResponse.data.shares) {
         for (const share of smbResponse.data.shares) {
+          const smbRaw: ExportRawConfig = {
+            smb_name: share.name,
+            smb_browsable: share.browsable !== false,
+            description: share.description || '',
+            zone: share.zone || 'System'
+          };
           const existingIndex = exports.findIndex(e => e.path === share.path);
           if (existingIndex >= 0) {
             exports[existingIndex].type = 'both';
+            // keep both the NFS rawConfig and the SMB name/description
+            exports[existingIndex].rawConfig = {
+              ...(exports[existingIndex].rawConfig || {}),
+              smb_name: smbRaw.smb_name,
+              smb_browsable: smbRaw.smb_browsable
+            };
           } else {
             exports.push({
               id: `smb-${share.id}`,
@@ -124,7 +185,8 @@ export class PowerScaleClient {
               clients: ['*'],
               permissions: 'read-write',
               description: share.description || `SMB Share: ${share.name}`,
-              size: 0
+              size: 0,
+              rawConfig: smbRaw
             });
           }
         }
@@ -136,30 +198,81 @@ export class PowerScaleClient {
     return exports;
   }
 
-  async createNfsExport(path: string, clients: string[] = ['*'], rootSquash: boolean = true): Promise<any> {
+  // Discover NFS aliases (short names like /rht that point at a real /ifs path).
+  // These are separate from exports and are otherwise easy to miss in a migration.
+  async discoverAliases(): Promise<NfsAlias[]> {
     await this.authenticate();
+    const aliases: NfsAlias[] = [];
+    try {
+      const resp = await this.client.get('/platform/4/protocols/nfs/aliases');
+      for (const a of resp.data.aliases || []) {
+        aliases.push({
+          name: a.name,
+          path: a.path,
+          zone: a.zone || 'System',
+          health: a.health
+        });
+      }
+    } catch (error) {
+      logger.warn('Failed to get NFS aliases from PowerScale:', error);
+    }
+    return aliases;
+  }
 
-    const exportConfig = {
-      paths: [path],
-      clients: clients,
-      root_clients: rootSquash ? [] : clients,
-      read_write_clients: clients,
-      security_flavors: ['unix', 'krb5']
-    };
-
-    const response = await this.client.post('/platform/4/protocols/nfs/exports', exportConfig);
-    logger.info(`Created NFS export for ${path} on PowerScale ${this.hostname}`);
+  async createNfsAlias(name: string, path: string, zone: string = 'System'): Promise<any> {
+    await this.authenticate();
+    const response = await this.client.post('/platform/4/protocols/nfs/aliases', {
+      name,
+      path,
+      zone
+    });
+    logger.info(`Created NFS alias ${name} -> ${path} on PowerScale ${this.hostname}`);
     return response.data;
   }
 
-  async createSmbShare(name: string, path: string, description: string = ''): Promise<any> {
+  // Create an NFS export on the target. When `raw` (the source export's full
+  // config) is provided, the real client lists / RO-RW split / root mapping /
+  // security flavors are reproduced; otherwise falls back to a generic export.
+  async createNfsExport(targetPath: string, raw?: ExportRawConfig, rootSquash: boolean = true): Promise<any> {
+    await this.authenticate();
+
+    const body: any = { paths: [targetPath] };
+    if (raw) {
+      if (raw.clients?.length) body.clients = raw.clients;
+      if (raw.root_clients?.length) body.root_clients = raw.root_clients;
+      if (raw.read_only_clients?.length) body.read_only_clients = raw.read_only_clients;
+      if (raw.read_write_clients?.length) body.read_write_clients = raw.read_write_clients;
+      if (raw.security_flavors?.length) body.security_flavors = raw.security_flavors;
+      if (typeof raw.read_only === 'boolean') body.read_only = raw.read_only;
+      if (typeof raw.all_dirs === 'boolean') body.all_dirs = raw.all_dirs;
+      if (raw.description) body.description = raw.description;
+      if (raw.map_root?.enabled && raw.map_root.user) {
+        body.map_root = { enabled: true, user: { name: raw.map_root.user } };
+      }
+      if (raw.map_all?.enabled && raw.map_all.user) {
+        body.map_all = { enabled: true, user: { name: raw.map_all.user } };
+      }
+    } else {
+      // Generic fallback (no captured source config)
+      body.clients = ['*'];
+      body.read_write_clients = ['*'];
+      if (!rootSquash) body.root_clients = ['*'];
+      body.security_flavors = ['unix'];
+    }
+
+    const response = await this.client.post('/platform/4/protocols/nfs/exports', body);
+    logger.info(`Created NFS export for ${targetPath} on PowerScale ${this.hostname}`);
+    return response.data;
+  }
+
+  async createSmbShare(name: string, path: string, description: string = '', browsable: boolean = true): Promise<any> {
     await this.authenticate();
 
     const shareConfig = {
       name: name,
       path: path,
       description: description,
-      browsable: true,
+      browsable: browsable,
       permissions: [
         {
           permission: 'full',
@@ -176,6 +289,38 @@ export class PowerScaleClient {
     const response = await this.client.post('/platform/12/protocols/smb/shares', shareConfig);
     logger.info(`Created SMB share ${name} on PowerScale ${this.hostname}`);
     return response.data;
+  }
+
+  // Build the `isi nfs exports create` CLI line, reproducing source fidelity
+  // when `raw` is present. NOTE: uses --root-clients / map-root rather than the
+  // (non-existent) --root-squash flag.
+  private nfsExportCreateCmd(targetPath: string, zone: string, raw?: ExportRawConfig, rootSquash = true): string {
+    const parts = [`isi nfs exports create "${targetPath}" --zone="${zone}"`];
+    const repeat = (flag: string, vals?: string[]) => {
+      for (const v of vals || []) parts.push(`${flag}="${v}"`);
+    };
+    if (raw) {
+      repeat('--clients', raw.clients);
+      repeat('--root-clients', raw.root_clients);
+      repeat('--read-only-clients', raw.read_only_clients);
+      repeat('--read-write-clients', raw.read_write_clients);
+      repeat('--security-flavors', raw.security_flavors);
+      if (raw.read_only) parts.push('--read-only=true');
+      if (raw.all_dirs) parts.push('--all-dirs=true');
+      if (raw.description) parts.push(`--description="${raw.description}"`);
+      if (raw.map_root?.enabled && raw.map_root.user) {
+        parts.push(`--map-root-enabled=true`, `--map-root-user="${raw.map_root.user}"`);
+      }
+      if (raw.map_all?.enabled && raw.map_all.user) {
+        parts.push(`--map-all-enabled=true`, `--map-all-user="${raw.map_all.user}"`);
+      }
+    } else {
+      parts.push('--clients="*"');
+      parts.push('--read-write-clients="*"');
+      // Root is squashed by default on OneFS; only grant root access when asked.
+      if (!rootSquash) parts.push('--root-clients="*"');
+    }
+    return parts.join(' ');
   }
 
   async createDirectory(path: string): Promise<boolean> {
@@ -218,7 +363,7 @@ export class PowerScaleClient {
     for (const exp of config.sourceExports) {
       if (exp.type === 'nfs' || exp.type === 'both') {
         const targetPath = `${config.targetBasePath}${exp.path}`;
-        script.push(`isi nfs exports create "${targetPath}" --zone="$ACCESS_ZONE" --clients="*" ${config.nfsSettings.rootSquash ? '--root-squash' : '--no-root-squash'}`);
+        script.push(this.nfsExportCreateCmd(targetPath, '$ACCESS_ZONE', exp.rawConfig, config.nfsSettings.rootSquash));
       }
     }
 
@@ -228,8 +373,22 @@ export class PowerScaleClient {
     for (const exp of config.sourceExports) {
       if (exp.type === 'smb' || exp.type === 'both') {
         const targetPath = `${config.targetBasePath}${exp.path}`;
-        const shareName = exp.path.split('/').filter(Boolean).pop() || 'share';
-        script.push(`isi smb shares create "${shareName}" "${targetPath}" --zone="$ACCESS_ZONE" ${config.smbSettings.allowGuest ? '--allow-guest' : ''}`);
+        const shareName = exp.rawConfig?.smb_name || exp.path.split('/').filter(Boolean).pop() || 'share';
+        let line = `isi smb shares create "${shareName}" "${targetPath}" --zone="$ACCESS_ZONE"`;
+        if (exp.rawConfig?.description) line += ` --description="${exp.rawConfig.description}"`;
+        if (config.smbSettings.allowGuest) line += ` --allow-guest`;
+        script.push(line);
+        // SMB share ACLs are not reproduced automatically; review manually:
+        script.push(`#   review permissions for share "${shareName}": isi smb shares permission list "${shareName}" --zone="$ACCESS_ZONE"`);
+      }
+    }
+
+    if (config.aliases && config.aliases.length) {
+      script.push('');
+      script.push('# Create NFS Aliases');
+      for (const alias of config.aliases) {
+        const targetPath = `${config.targetBasePath}${alias.path}`;
+        script.push(`isi nfs aliases create "${alias.name}" "${targetPath}" --zone="$ACCESS_ZONE"`);
       }
     }
 
@@ -259,7 +418,7 @@ export class PowerScaleClient {
       if (exp.type === 'nfs' || exp.type === 'both') {
         const targetPath = `${config.targetBasePath}${exp.path}`;
         try {
-          await this.createNfsExport(targetPath, ['*'], config.nfsSettings.rootSquash);
+          await this.createNfsExport(targetPath, exp.rawConfig, config.nfsSettings.rootSquash);
           results.push({ action: 'createNfsExport', path: targetPath, success: true });
         } catch (error) {
           results.push({ action: 'createNfsExport', path: targetPath, success: false, error: (error as Error).message });
@@ -271,13 +430,29 @@ export class PowerScaleClient {
     for (const exp of config.sourceExports) {
       if (exp.type === 'smb' || exp.type === 'both') {
         const targetPath = `${config.targetBasePath}${exp.path}`;
-        const shareName = exp.path.split('/').filter(Boolean).pop() || 'share';
+        const shareName = exp.rawConfig?.smb_name || exp.path.split('/').filter(Boolean).pop() || 'share';
         try {
-          await this.createSmbShare(shareName, targetPath);
+          await this.createSmbShare(
+            shareName,
+            targetPath,
+            exp.rawConfig?.description || '',
+            exp.rawConfig?.smb_browsable !== false
+          );
           results.push({ action: 'createSmbShare', name: shareName, path: targetPath, success: true });
         } catch (error) {
           results.push({ action: 'createSmbShare', name: shareName, path: targetPath, success: false, error: (error as Error).message });
         }
+      }
+    }
+
+    // Create NFS aliases
+    for (const alias of config.aliases || []) {
+      const targetPath = `${config.targetBasePath}${alias.path}`;
+      try {
+        await this.createNfsAlias(alias.name, targetPath, config.nfsSettings.accessZone || 'System');
+        results.push({ action: 'createNfsAlias', name: alias.name, path: targetPath, success: true });
+      } catch (error) {
+        results.push({ action: 'createNfsAlias', name: alias.name, path: targetPath, success: false, error: (error as Error).message });
       }
     }
 

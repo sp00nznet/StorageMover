@@ -56,6 +56,19 @@ export async function initDatabase(): Promise<void> {
       permissions TEXT,
       description TEXT,
       size_bytes INTEGER,
+      raw_config TEXT,
+      discovered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
+    );
+
+    -- NFS aliases discovered from devices (e.g. /rht -> /ifs/.../rht)
+    CREATE TABLE IF NOT EXISTS nfs_aliases (
+      id TEXT PRIMARY KEY,
+      device_id TEXT NOT NULL,
+      name TEXT NOT NULL,
+      path TEXT NOT NULL,
+      zone TEXT DEFAULT 'System',
+      health TEXT,
       discovered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (device_id) REFERENCES devices(id) ON DELETE CASCADE
     );
@@ -149,6 +162,7 @@ export async function initDatabase(): Promise<void> {
 
     -- Create indexes
     CREATE INDEX IF NOT EXISTS idx_exports_device ON exports(device_id);
+    CREATE INDEX IF NOT EXISTS idx_nfs_aliases_device ON nfs_aliases(device_id);
     CREATE INDEX IF NOT EXISTS idx_migrations_status ON migrations(status);
     CREATE INDEX IF NOT EXISTS idx_migration_items_migration ON migration_items(migration_id);
     CREATE INDEX IF NOT EXISTS idx_activity_log_created ON activity_log(created_at);
@@ -162,10 +176,20 @@ export async function initDatabase(): Promise<void> {
       if (err) {
         logger.error('Failed to initialize database schema:', err);
         reject(err);
-      } else {
+        return;
+      }
+      // Lightweight migration for pre-existing databases: add columns that the
+      // CREATE TABLE IF NOT EXISTS above won't add to an already-created table.
+      // SQLite has no "ADD COLUMN IF NOT EXISTS", so we ignore duplicate-column errors.
+      db.run('ALTER TABLE exports ADD COLUMN raw_config TEXT', (alterErr) => {
+        if (alterErr && !/duplicate column name/i.test(alterErr.message)) {
+          logger.error('Migration (exports.raw_config) failed:', alterErr);
+          reject(alterErr);
+          return;
+        }
         logger.info('Database schema initialized');
         resolve();
-      }
+      });
     });
   });
 }

@@ -193,15 +193,18 @@ deviceRouter.post('/:id/discover', async (req: Request, res: Response) => {
     const password = decryptPassword(device.password_encrypted);
     let client;
     let exports: any[] = [];
+    let aliases: any[] = [];
 
     switch (device.type) {
       case 'isilon':
         client = new IsilonClient(device.hostname, device.port, device.username, password);
         exports = await client.discoverExports();
+        aliases = await client.discoverAliases();
         break;
       case 'powerscale':
         client = new PowerScaleClient(device.hostname, device.port, device.username, password);
         exports = await client.discoverExports();
+        aliases = await client.discoverAliases();
         break;
       case 'powerstore':
         client = new PowerStoreClient(device.hostname, device.port, device.username, password);
@@ -245,18 +248,32 @@ deviceRouter.post('/:id/discover', async (req: Request, res: Response) => {
         break;
     }
 
+    // Replace this device's exports/aliases with the freshly discovered set
+    await dbRun('DELETE FROM exports WHERE device_id = ?', [device.id]);
+    await dbRun('DELETE FROM nfs_aliases WHERE device_id = ?', [device.id]);
+
     // Store discovered exports in database
     for (const exp of exports) {
       const exportId = uuidv4();
       await dbRun(
-        `INSERT OR REPLACE INTO exports (id, device_id, export_path, export_type, clients, permissions, description, size_bytes)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [exportId, device.id, exp.path, exp.type, JSON.stringify(exp.clients), exp.permissions, exp.description, exp.size]
+        `INSERT OR REPLACE INTO exports (id, device_id, export_path, export_type, clients, permissions, description, size_bytes, raw_config)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [exportId, device.id, exp.path, exp.type, JSON.stringify(exp.clients), exp.permissions, exp.description, exp.size, exp.rawConfig ? JSON.stringify(exp.rawConfig) : null]
       );
     }
 
-    logger.info(`Discovered ${exports.length} exports from ${device.name}`);
-    res.json({ exports, count: exports.length });
+    // Store discovered NFS aliases
+    for (const alias of aliases) {
+      const aliasId = uuidv4();
+      await dbRun(
+        `INSERT OR REPLACE INTO nfs_aliases (id, device_id, name, path, zone, health)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [aliasId, device.id, alias.name, alias.path, alias.zone || 'System', alias.health || null]
+      );
+    }
+
+    logger.info(`Discovered ${exports.length} exports and ${aliases.length} aliases from ${device.name}`);
+    res.json({ exports, aliases, count: exports.length, aliasCount: aliases.length });
   } catch (error) {
     logger.error('Failed to discover exports:', error);
     res.status(500).json({ error: 'Failed to discover exports', details: (error as Error).message });
