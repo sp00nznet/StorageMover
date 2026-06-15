@@ -1,6 +1,22 @@
 import { useState, useEffect } from 'react';
 import axios from 'axios';
-import { FolderOutput, Server, Filter, Trash2 } from 'lucide-react';
+import { FolderOutput, Server, Filter, Trash2, Link2 } from 'lucide-react';
+
+interface RawConfig {
+  clients?: string[];
+  root_clients?: string[];
+  read_only_clients?: string[];
+  read_write_clients?: string[];
+  read_only?: boolean;
+  all_dirs?: boolean;
+  security_flavors?: string[];
+  map_root?: { enabled?: boolean; user?: string };
+  map_all?: { enabled?: boolean; user?: string };
+  description?: string;
+  zone?: string;
+  smb_name?: string;
+  smb_browsable?: boolean;
+}
 
 interface Export {
   id: string;
@@ -14,7 +30,18 @@ interface Export {
   permissions: string;
   description: string;
   size_bytes: number;
+  raw_config: RawConfig | null;
   discovered_at: string;
+}
+
+interface NfsAlias {
+  id: string;
+  device_id: string;
+  device_name: string;
+  hostname: string;
+  name: string;
+  path: string;
+  zone: string;
 }
 
 interface Device {
@@ -25,6 +52,7 @@ interface Device {
 
 function Exports() {
   const [exports, setExports] = useState<Export[]>([]);
+  const [aliases, setAliases] = useState<NfsAlias[]>([]);
   const [devices, setDevices] = useState<Device[]>([]);
   const [loading, setLoading] = useState(true);
   const [selectedDevice, setSelectedDevice] = useState<string>('');
@@ -36,11 +64,13 @@ function Exports() {
 
   const fetchData = async () => {
     try {
-      const [exportsRes, devicesRes] = await Promise.all([
+      const [exportsRes, aliasesRes, devicesRes] = await Promise.all([
         axios.get('/api/exports'),
+        axios.get('/api/exports/aliases'),
         axios.get('/api/devices')
       ]);
       setExports(exportsRes.data);
+      setAliases(aliasesRes.data);
       setDevices(devicesRes.data);
     } catch (error) {
       console.error('Failed to fetch data:', error);
@@ -84,6 +114,29 @@ function Exports() {
     if (selectedType && exp.export_type !== selectedType) return false;
     return true;
   });
+
+  // NFS aliases are NFS-only; hide them when the user filters to SMB
+  const filteredAliases = aliases.filter((a) => {
+    if (selectedDevice && a.device_id !== selectedDevice) return false;
+    if (selectedType === 'smb') return false;
+    return true;
+  });
+
+  // Compact summary chips of the captured per-export config (fidelity carried
+  // to the target on migration).
+  const rawConfigChips = (rc: RawConfig | null): { label: string; value: string }[] => {
+    if (!rc) return [];
+    const chips: { label: string; value: string }[] = [];
+    if (rc.root_clients?.length) chips.push({ label: 'root', value: rc.root_clients.join(', ') });
+    if (rc.read_only_clients?.length) chips.push({ label: 'ro', value: rc.read_only_clients.join(', ') });
+    if (rc.read_write_clients?.length) chips.push({ label: 'rw', value: rc.read_write_clients.join(', ') });
+    if (rc.security_flavors?.length) chips.push({ label: 'sec', value: rc.security_flavors.join(', ') });
+    if (rc.all_dirs) chips.push({ label: 'all-dirs', value: 'yes' });
+    if (rc.read_only) chips.push({ label: 'read-only', value: 'yes' });
+    if (rc.map_root?.enabled && rc.map_root.user) chips.push({ label: 'map-root', value: rc.map_root.user });
+    if (rc.map_all?.enabled && rc.map_all.user) chips.push({ label: 'map-all', value: rc.map_all.user });
+    return chips;
+  };
 
   if (loading) {
     return (
@@ -178,6 +231,20 @@ function Exports() {
                         Clients: {exp.clients.join(', ')}
                       </p>
                     )}
+                    {rawConfigChips(exp.raw_config).length > 0 && (
+                      <div className="flex flex-wrap gap-1.5 mt-2">
+                        {rawConfigChips(exp.raw_config).map((chip) => (
+                          <span
+                            key={chip.label}
+                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-gray-100 text-xs text-gray-600 font-mono"
+                            title={`${chip.label}: ${chip.value}`}
+                          >
+                            <span className="text-gray-400">{chip.label}:</span>
+                            <span className="truncate max-w-[16rem]">{chip.value}</span>
+                          </span>
+                        ))}
+                      </div>
+                    )}
                     {exp.description && (
                       <p className="text-sm text-gray-500 mt-2">{exp.description}</p>
                     )}
@@ -189,6 +256,35 @@ function Exports() {
                   >
                     <Trash2 className="h-4 w-4" />
                   </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {filteredAliases.length > 0 && (
+        <div className="mt-8">
+          <div className="flex items-center gap-2 mb-3">
+            <Link2 className="h-5 w-5 text-dell-blue" />
+            <h2 className="text-lg font-semibold text-gray-900">NFS Aliases</h2>
+            <span className="text-sm text-gray-500">({filteredAliases.length})</span>
+          </div>
+          <div className="grid gap-3">
+            {filteredAliases.map((a) => (
+              <div key={a.id} className="card py-3">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <Link2 className="h-4 w-4 text-dell-blue" />
+                  <span className="font-mono font-medium text-gray-900">{a.name}</span>
+                  <span className="text-gray-400">&rarr;</span>
+                  <span className="font-mono text-sm text-gray-600">{a.path}</span>
+                </div>
+                <div className="flex items-center gap-4 text-sm text-gray-500 mt-1">
+                  <span className="flex items-center gap-1">
+                    <Server className="h-4 w-4" />
+                    {a.device_name} ({a.hostname})
+                  </span>
+                  {a.zone && <span>Zone: {a.zone}</span>}
                 </div>
               </div>
             ))}
