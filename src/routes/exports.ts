@@ -16,6 +16,7 @@ interface Export {
   permissions: string;
   description: string;
   size_bytes: number;
+  raw_config: string | null;
   discovered_at: string;
 }
 
@@ -39,16 +40,44 @@ exportRouter.get('/', async (req: Request, res: Response) => {
 
     const exports = await dbAll<Export & { device_name: string; device_type: string; hostname: string }>(query, params);
 
-    // Parse clients JSON
+    // Parse clients + captured raw_config JSON
     const parsedExports = exports.map(exp => ({
       ...exp,
-      clients: JSON.parse(exp.clients || '[]')
+      clients: JSON.parse(exp.clients || '[]'),
+      raw_config: exp.raw_config ? JSON.parse(exp.raw_config) : null
     }));
 
     res.json(parsedExports);
   } catch (error) {
     logger.error('Failed to get exports:', error);
     res.status(500).json({ error: 'Failed to get exports' });
+  }
+});
+
+// List discovered NFS aliases (defined before '/:id' so it isn't shadowed)
+exportRouter.get('/aliases', async (req: Request, res: Response) => {
+  try {
+    const deviceId = req.query.deviceId as string;
+    let query = `
+      SELECT a.id, a.device_id, a.name, a.path, a.zone, a.health, a.discovered_at,
+             d.name as device_name, d.type as device_type, d.hostname
+      FROM nfs_aliases a
+      JOIN devices d ON a.device_id = d.id
+    `;
+    const params: any[] = [];
+
+    if (deviceId) {
+      query += ' WHERE a.device_id = ?';
+      params.push(deviceId);
+    }
+
+    query += ' ORDER BY a.name';
+
+    const aliases = await dbAll(query, params);
+    res.json(aliases);
+  } catch (error) {
+    logger.error('Failed to get NFS aliases:', error);
+    res.status(500).json({ error: 'Failed to get NFS aliases' });
   }
 });
 
