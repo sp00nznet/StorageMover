@@ -37,6 +37,7 @@ DRY_RUN=0
 DEEP=0
 CHECKSUM=0
 INSECURE=0
+JSON=0
 
 # StorageMover login
 SM_USER="${SM_USER:-admin}"
@@ -56,14 +57,28 @@ TARGET_BASE_PATH="${TARGET_BASE_PATH:-}"
 TOKEN="${SMOVER_TOKEN:-}"
 
 # ---- pretty output --------------------------------------------------------
+# In --json mode all human log lines go to stderr so stdout stays pure JSON.
 c_red=$'\033[31m'; c_grn=$'\033[32m'; c_yel=$'\033[33m'; c_dim=$'\033[2m'; c_off=$'\033[0m'
-ok()   { printf '%s[ OK ]%s %s\n'   "$c_grn" "$c_off" "$*"; }
-fail() { printf '%s[FAIL]%s %s\n'   "$c_red" "$c_off" "$*"; }
-warn() { printf '%s[WARN]%s %s\n'   "$c_yel" "$c_off" "$*"; }
-info() { printf '%s----- %s%s\n'    "$c_dim" "$*" "$c_off"; }
-die()  { fail "$*"; exit 1; }
+_p()   { if [[ "$JSON" == 1 ]]; then printf '%s\n' "$1" >&2; else printf '%s\n' "$1"; fi; }
+_detail() { if [[ "$JSON" == 1 ]]; then cat >&2; else cat; fi; }   # multiline detail blocks
+ok()   { _p "${c_grn}[ OK ]${c_off} $*"; }
+fail() { _p "${c_red}[FAIL]${c_off} $*"; }
+warn() { _p "${c_yel}[WARN]${c_off} $*"; }
+info() { _p "${c_dim}----- $* ${c_off}"; }
+json_str() { local s="$1"; s="${s//\\/\\\\}"; s="${s//\"/\\\"}"; printf '"%s"' "$s"; }
+die()  {
+  if [[ "$JSON" == 1 ]]; then printf '{"error":%s,"passed":false}\n' "$(json_str "$*")"; else fail "$*"; fi
+  exit 1
+}
 
 VERIFY_FAILED=0
+
+# ---- verify result capture (populated by the verify commands, for --json) --
+J_DIR_EXISTS=null; J_NFS=unknown; J_EXPORTS=""
+J_SRC_FILES=null; J_DST_FILES=null; J_FILES_MATCH=null
+J_SRC_KB=null; J_DST_KB=null; J_DU_MATCH=null
+J_DEEP_CHECKED=false; J_DEEP_MODE=""
+J_MISSING=""; J_EXTRA=""; J_MISMATCH=""
 
 # ---- ssh helper -----------------------------------------------------------
 ssh_opts() {
@@ -189,29 +204,33 @@ cmd_verify_share() {
 
   # 1. Target directory is present and is a directory
   if rsh "$DST_USER@$DST_HOST" "test -d '$DST_PATH'" 2>/dev/null; then
-    ok "target directory exists: $DST_PATH"
+    ok "target directory exists: $DST_PATH"; J_DIR_EXISTS=true
   else
     fail "target directory MISSING or not a dir: $DST_PATH"
-    VERIFY_FAILED=1
+    J_DIR_EXISTS=false; VERIFY_FAILED=1
   fi
 
   # 2. NFS export is actually published by the target (best-effort)
   if command -v showmount >/dev/null 2>&1; then
     local exp
     exp=$(showmount -e "$DST_HOST" 2>/dev/null | awk 'NR>1{print $1}')
+    J_EXPORTS="$exp"
     if [[ -z "$exp" ]]; then
       warn "showmount returned no exports from $DST_HOST (mountd blocked? or SMB-only)"
+      J_NFS=none
     elif grep -qxF "$DST_PATH" <<<"$exp"; then
-      ok "NFS export published for exact path: $DST_PATH"
+      ok "NFS export published for exact path: $DST_PATH"; J_NFS=exact
     elif grep -q "$DST_PATH" <<<"$exp"; then
-      ok "NFS export published under path (alias/parent): $DST_PATH"
+      ok "NFS export published under path (alias/parent): $DST_PATH"; J_NFS=parent
     else
       warn "no NFS export matching $DST_PATH. Published exports:"
-      sed 's/^/       /' <<<"$exp"
+      sed 's/^/       /' <<<"$exp" | _detail
       warn "  (dir exists but may not be re-exported yet — create the export on the target)"
+      J_NFS=none
     fi
   else
     warn "showmount not installed locally; skipped NFS-export check (dir check still ran)"
+    J_NFS=skipped
   fi
 }
 
@@ -229,31 +248,34 @@ cmd_verify_content() {
   info "(b) CONTENT EXISTS ON TARGET"
 
   local sc dc
-  sc=$(remote_count "$SRC_USER" "$SRC_HOST" "$SRC_PATH")
-  dc=$(remote_count "$DST_USER" "$DST_HOST" "$DST_PATH")
+  sc=$(remote_count "$SRC_USER" "$SRC_HOST" "$SRC_PATH"); sc=${sc//[^0-9-]/}
+  dc=$(remote_count "$DST_USER" "$DST_HOST" "$DST_PATH"); dc=${dc//[^0-9-]/}
+  J_SRC_FILES=${sc:-null}; J_DST_FILES=${dc:-null}
   [[ "$sc" == -1 ]] && { fail "source path unreadable: $SRC_PATH"; VERIFY_FAILED=1; return; }
   [[ "$dc" == -1 ]] && { fail "target path unreadable: $DST_PATH"; VERIFY_FAILED=1; return; }
 
-  printf '   source files: %s\n   target files: %s\n' "$sc" "$dc"
+  _p "$(printf '   source files: %s\n   target files: %s' "$sc" "$dc")"
   if [[ "$sc" == "$dc" ]]; then
-    ok "file counts match ($sc)"
+    ok "file counts match ($sc)"; J_FILES_MATCH=true
   else
     fail "file count mismatch (src=$sc target=$dc)"
-    VERIFY_FAILED=1
+    J_FILES_MATCH=false; VERIFY_FAILED=1
   fi
 
   local sk dk
-  sk=$(remote_du_kb "$SRC_USER" "$SRC_HOST" "$SRC_PATH")
-  dk=$(remote_du_kb "$DST_USER" "$DST_HOST" "$DST_PATH")
-  printf '   source size : %s KB\n   target size : %s KB %s\n' "$sk" "$dk" "$c_dim(du, block-based — approximate)$c_off"
+  sk=$(remote_du_kb "$SRC_USER" "$SRC_HOST" "$SRC_PATH"); sk=${sk//[^0-9-]/}
+  dk=$(remote_du_kb "$DST_USER" "$DST_HOST" "$DST_PATH"); dk=${dk//[^0-9-]/}
+  J_SRC_KB=${sk:-null}; J_DST_KB=${dk:-null}
+  _p "$(printf '   source size : %s KB\n   target size : %s KB %s' "$sk" "$dk" "${c_dim}(du, block-based — approximate)${c_off}")"
   if [[ "$sk" == "$dk" ]]; then
-    ok "du sizes match"
+    ok "du sizes match"; J_DU_MATCH=true
   else
+    J_DU_MATCH=false
     warn "du sizes differ — often just block-allocation differences between arrays;"
     warn "  run '--deep verify-content' for an authoritative byte-level comparison"
   fi
 
-  [[ "$DEEP" == 1 || "$CHECKSUM" == 1 ]] && deep_compare
+  if [[ "$DEEP" == 1 || "$CHECKSUM" == 1 ]]; then deep_compare; fi
 }
 
 # ---- deep byte-level (and optional checksum) manifest diff -----------------
@@ -277,6 +299,7 @@ REMOTE
 
 deep_compare() {
   local mode="byte-size"; [[ "$CHECKSUM" == 1 ]] && mode="byte-size+cksum"
+  J_DEEP_CHECKED=true; J_DEEP_MODE="$mode"
   info "deep compare ($mode) — per-file, may take a while on large trees"
   local tmp; tmp=$(mktemp -d)
   trap 'rm -rf "$tmp"' RETURN
@@ -292,11 +315,12 @@ deep_compare() {
   local only_src only_dst
   only_src=$(comm -23 "$tmp/src.paths" "$tmp/dst.paths")
   only_dst=$(comm -13 "$tmp/src.paths" "$tmp/dst.paths")
+  J_MISSING="$only_src"; J_EXTRA="$only_dst"
 
   if [[ -n "$only_src" ]]; then
     fail "$(wc -l <<<"$only_src") file(s) present on source but MISSING on target:"
-    sed 's/^/       /' <<<"$only_src" | head -20
-    [[ $(wc -l <<<"$only_src") -gt 20 ]] && echo "       ... (truncated)"
+    sed 's/^/       /' <<<"$only_src" | head -20 | _detail
+    [[ $(wc -l <<<"$only_src") -gt 20 ]] && _p "       ... (truncated)"
     VERIFY_FAILED=1
   else
     ok "every source file is present on the target"
@@ -309,17 +333,60 @@ deep_compare() {
     if (NF>=5) { if ($2!=$4 || $3!=$5) print $1 }   # path,ssz,scks,dsz,dcks
     else       { if ($2!=$3)          print $1 }    # path,ssz,dsz
   }')
+  J_MISMATCH="$diffs"
   if [[ -n "$diffs" ]]; then
     fail "$(wc -l <<<"$diffs") file(s) differ in size/checksum between source and target:"
-    sed 's/^/       /' <<<"$diffs" | head -20
-    [[ $(wc -l <<<"$diffs") -gt 20 ]] && echo "       ... (truncated)"
+    sed 's/^/       /' <<<"$diffs" | head -20 | _detail
+    [[ $(wc -l <<<"$diffs") -gt 20 ]] && _p "       ... (truncated)"
     VERIFY_FAILED=1
   else
     ok "all common files match (${mode})"
   fi
 }
 
-cmd_verify() { cmd_verify_share; echo; cmd_verify_content; }
+cmd_verify() { cmd_verify_share; _p ""; cmd_verify_content; }
+
+# ---- emit captured verify results as one JSON object ----------------------
+emit_verify_json() { # <scope: share|content|verify>
+  need jq
+  local passed=true; [[ "$VERIFY_FAILED" == 0 ]] || passed=false
+  jq -nc \
+    --arg cmd "$1" \
+    --arg sh "$SRC_HOST" --arg su "$SRC_USER" --arg sp "$SRC_PATH" \
+    --arg dh "$DST_HOST" --arg du "$DST_USER" --arg dp "$DST_PATH" \
+    --argjson dir "$J_DIR_EXISTS" --arg nfs "$J_NFS" --arg exports "$J_EXPORTS" \
+    --argjson sf "${J_SRC_FILES:-null}" --argjson df "${J_DST_FILES:-null}" --argjson fm "$J_FILES_MATCH" \
+    --argjson sk "${J_SRC_KB:-null}" --argjson dk "${J_DST_KB:-null}" --argjson dm "$J_DU_MATCH" \
+    --argjson deep "$J_DEEP_CHECKED" --arg dmode "$J_DEEP_MODE" \
+    --arg missing "$J_MISSING" --arg extra "$J_EXTRA" --arg mismatch "$J_MISMATCH" \
+    --argjson passed "$passed" '
+    def arr($s): ($s | split("\n") | map(select(length>0)));
+    {
+      command: $cmd,
+      source: {host:$sh, user:$su, path:$sp},
+      target: {host:$dh, user:$du, path:$dp},
+      share: (if $cmd=="content" then null else
+        {target_dir_exists:$dir, nfs_export:$nfs, published_exports:arr($exports)} end),
+      content: (if $cmd=="share" then null else
+        {source_files:$sf, target_files:$df, files_match:$fm,
+         source_kb:$sk, target_kb:$dk, du_match:$dm,
+         deep: (if $deep then
+           {mode:$dmode, missing_on_target:arr($missing),
+            extra_on_target:arr($extra), mismatched:arr($mismatch)}
+         else null end)} end),
+      passed: $passed
+    }'
+}
+
+# ---- finish a verify run: emit (json or human) + set exit code ------------
+finish_verify() { # <scope>
+  [[ "$JSON" == 1 ]] && emit_verify_json "$1"
+  if [[ "$VERIFY_FAILED" == 0 ]]; then
+    [[ "$JSON" == 1 ]] || ok "VERIFY PASSED"; exit 0
+  else
+    [[ "$JSON" == 1 ]] || fail "VERIFY FAILED"; exit 1
+  fi
+}
 
 # ---- rsync dry-run preview (genuine "what would move" preflight) ----------
 # Runs ON the target, pulling from source with -n, exactly like a real
@@ -362,6 +429,8 @@ VERIFY OPTIONS (flags OR env vars):
   --deep         byte-for-byte per-file manifest comparison (authoritative)
   --checksum     add per-file cksum to the deep compare (slowest, paranoid)
   --insecure     disable SSH host-key checking (lab / first-contact only)
+  --json         emit one JSON result object on stdout (logs go to stderr);
+                 exit 0 = passed, 1 = failed. For CI/cron. Needs jq.
 
 MIGRATE OPTIONS:
   --api URL      \$SMOVER_API   (default http://localhost:3001/api)
@@ -387,6 +456,11 @@ EXAMPLES:
 
   # Preview a migration without moving anything:
   SM_PASS=... $0 --src-host oldnas --dst-host newnas --dry-run migrate
+
+  # CI/cron: machine-readable result, nonzero exit on failure:
+  $0 --src-host oldnas --src-path /ifs/data/acct \\
+     --dst-host newnas --dst-path /ifs/migrated/ifs/data/acct \\
+     --deep --json verify | jq .
 EOF
 }
 
@@ -411,6 +485,7 @@ while [[ $# -gt 0 ]]; do
     --deep)         DEEP=1; shift;;
     --checksum)     CHECKSUM=1; DEEP=1; shift;;
     --insecure)     INSECURE=1; shift;;
+    --json)         JSON=1; shift;;
     --dry-run)      DRY_RUN=1; shift;;
     -h|--help)      usage; exit 0;;
     -*)             die "unknown option: $1 (try --help)";;
@@ -419,9 +494,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$CMD" in
-  verify)          cmd_verify;         [[ "$VERIFY_FAILED" == 0 ]] && ok "VERIFY PASSED" || die "VERIFY FAILED";;
-  verify-share)    cmd_verify_share;   [[ "$VERIFY_FAILED" == 0 ]] || die "VERIFY FAILED";;
-  verify-content)  cmd_verify_content; [[ "$VERIFY_FAILED" == 0 ]] || die "VERIFY FAILED";;
+  verify)          cmd_verify;         finish_verify verify;;
+  verify-share)    cmd_verify_share;   finish_verify share;;
+  verify-content)  cmd_verify_content; finish_verify content;;
   preflight)       cmd_preflight;;
   migrate)         cmd_migrate;;
   start)           [[ -n "$ARG1" ]] || die "start needs a migration id"; cmd_start "$ARG1";;
